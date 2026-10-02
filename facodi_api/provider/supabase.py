@@ -57,6 +57,7 @@ class SupabaseProvider(ProviderAdapter):
 
         headers = {
             "apikey": secret,
+            "Authorization": f"Bearer {secret}",
             "Content-Type": "application/json",
             "user-agent": "FACODI-Odoo/19 SupabaseProvider",
         }

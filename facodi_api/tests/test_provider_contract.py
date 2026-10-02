@@ -41,6 +41,7 @@ class ProviderContractTest(unittest.TestCase):
         endpoint = request_mock.call_args.args[0]
         self.assertEqual(endpoint, "https://example.supabase.co/functions/v1/v2_ingest_youtube_video")
         self.assertEqual(request_mock.call_args.kwargs["headers"]["apikey"], "secret-key")
+        self.assertEqual(request_mock.call_args.kwargs["headers"]["Authorization"], "Bearer secret-key")
 
     def test_supabase_uses_project_default_functions(self):
         with mock.patch.dict(
