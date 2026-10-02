@@ -1,9 +1,11 @@
+from .provider.abacate import AbacatePayProvider
 from .provider.registry import get_provider, register_provider
 from .provider.stripe import StripeProvider
 from .provider.supabase import SupabaseProvider
 
 register_provider("supabase", SupabaseProvider)
 register_provider("stripe", StripeProvider)
+register_provider("abacate", AbacatePayProvider)
 
 
 class FacodiApiService:

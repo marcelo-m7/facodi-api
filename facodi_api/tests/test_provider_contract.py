@@ -20,9 +20,10 @@ class FakeResponse:
 class ProviderContractTest(unittest.TestCase):
     def test_registry_exposes_core_providers(self):
         providers = set(list_providers())
-        self.assertTrue({"supabase", "stripe"}.issubset(providers))
+        self.assertTrue({"supabase", "stripe", "abacate"}.issubset(providers))
         self.assertIsNotNone(get_provider("supabase"))
         self.assertIsNotNone(get_provider("stripe"))
+        self.assertIsNotNone(get_provider("abacate"))
 
     def test_supabase_dispatch_uses_env_and_returns_payload(self):
         with mock.patch.dict(
@@ -60,6 +61,33 @@ class ProviderContractTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(RuntimeError):
                 FacodiApiService.dispatch("supabase", "video.ingest", {"slide_id": 42})
+
+    def test_abacate_dispatch_uses_env_and_returns_payload(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ABACATE_PAY_API_KEY": "api_key_123",
+                "ABACATE_PAY_SECRET_KEY": "secret_key_456",
+                "ABACATE_PAY_BASE_URL": "https://api.abacatepay.com",
+            },
+            clear=False,
+        ), mock.patch("facodi_api.provider.abacate.requests.post", return_value=FakeResponse({"id": "pay_123", "status": "open"})) as request_mock:
+            result = FacodiApiService.dispatch(
+                "abacate",
+                "checkout.session.create",
+                {"amount": 1000, "currency": "BRL", "description": "Curso FACODI"},
+            )
+
+        self.assertEqual(result["id"], "pay_123")
+        endpoint = request_mock.call_args.args[0]
+        self.assertEqual(endpoint, "https://api.abacatepay.com/api/v1/checkout/sessions")
+        self.assertEqual(request_mock.call_args.kwargs["headers"]["Authorization"], "Bearer api_key_123")
+        self.assertEqual(request_mock.call_args.kwargs["headers"]["X-Api-Key"], "api_key_123")
+
+    def test_abacate_requires_configuration(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(RuntimeError):
+                FacodiApiService.dispatch("abacate", "checkout.session.create", {"amount": 1000})
 
     def test_stripe_dispatch_uses_secret_key(self):
         fake_module = type("FakeStripe", (), {})
