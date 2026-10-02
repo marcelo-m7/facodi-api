@@ -14,3 +14,30 @@ class FacodiApiService:
             raise KeyError(f"Unknown provider: {provider_name}")
         provider = provider_cls(config=config or {})
         return provider.dispatch(function_name, payload or {})
+
+    @staticmethod
+    def ingest_video(payload=None, config=None):
+        return FacodiApiService.dispatch(
+            "supabase",
+            "video.ingest",
+            payload or {},
+            config=config,
+        )
+
+    @staticmethod
+    def analyze_resource(payload=None, config=None):
+        return FacodiApiService.dispatch(
+            "supabase",
+            "resource.analyze",
+            payload or {},
+            config=config,
+        )
+
+    @staticmethod
+    def discover_metadata(payload=None, config=None):
+        return FacodiApiService.dispatch(
+            "supabase",
+            "resource.metadata",
+            payload or {},
+            config=config,
+        )

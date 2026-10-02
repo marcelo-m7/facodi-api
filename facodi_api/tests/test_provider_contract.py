@@ -25,20 +25,40 @@ class ProviderContractTest(unittest.TestCase):
         self.assertIsNotNone(get_provider("stripe"))
 
     def test_supabase_dispatch_uses_env_and_returns_payload(self):
-        with mock.patch.dict(os.environ, {"SUPABASE_URL": "https://example.supabase.co", "SUPABASE_SECRET_KEY": "secret-key"}, clear=False), mock.patch("facodi_api.provider.supabase.requests.post", return_value=FakeResponse({"ok": True})) as request_mock:
+        with mock.patch.dict(
+            os.environ,
+            {"SUPABASE_URL": "https://example.supabase.co", "SUPABASE_SECRET_KEY": "secret-key"},
+            clear=False,
+        ), mock.patch("facodi_api.provider.supabase.requests.post", return_value=FakeResponse({"ok": True})) as request_mock:
             result = FacodiApiService.dispatch(
                 "supabase",
-                "video-ingest",
+                "video.ingest",
                 {"slide_id": 42, "title": "Demo"},
             )
 
         self.assertEqual(result, {"ok": True})
         request_mock.assert_called_once()
+        endpoint = request_mock.call_args.args[0]
+        self.assertEqual(endpoint, "https://example.supabase.co/functions/v1/v2_ingest_youtube_video")
+        self.assertEqual(request_mock.call_args.kwargs["headers"]["apikey"], "secret-key")
+
+    def test_supabase_uses_project_default_functions(self):
+        with mock.patch.dict(
+            os.environ,
+            {"SUPABASE_URL": "https://example.supabase.co", "SUPABASE_SECRET_KEY": "secret-key"},
+            clear=False,
+        ), mock.patch("facodi_api.provider.supabase.requests.post", return_value=FakeResponse({"status": "ok"})) as request_mock:
+            FacodiApiService.analyze_resource({"source_url": "https://example.com/resource"})
+            FacodiApiService.discover_metadata({"source_url": "https://example.com/resource"})
+
+        endpoints = [call.args[0] for call in request_mock.call_args_list]
+        self.assertIn("https://example.supabase.co/functions/v1/v3_analyze_learning_resource", endpoints)
+        self.assertIn("https://example.supabase.co/functions/v1/v3_discover_resource_metadata", endpoints)
 
     def test_supabase_requires_configuration(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(RuntimeError):
-                FacodiApiService.dispatch("supabase", "video-ingest", {"slide_id": 42})
+                FacodiApiService.dispatch("supabase", "video.ingest", {"slide_id": 42})
 
     def test_stripe_dispatch_uses_secret_key(self):
         fake_module = type("FakeStripe", (), {})
