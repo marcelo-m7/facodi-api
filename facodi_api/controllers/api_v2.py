@@ -32,7 +32,7 @@ class FacodiApiV2Controller(http.Controller):
             raise Forbidden("Pipeline reviewer access is required.")
         return True
 
-    @http.route("/facodi/api/v2/pipeline/runs", type="http", auth="bearer", methods=["POST"], csrf=False)
+    @http.route("/facodi/api/v2/pipeline/runs", type="http", auth="bearer", methods=["POST"], csrf=False, max_content_length=262144)
     def create_pipeline_run(self, **kwargs):
         """Submit a content item for ingestion and processing. Responds 202 Accepted asynchronously."""
         self._check_auth()
