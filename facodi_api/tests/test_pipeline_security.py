@@ -231,7 +231,8 @@ class TestPipelineSecurity(TransactionCase):
             'name': 'Existing original', 'channel_id': self.channel.id,
             'slide_category': 'article', 'html_content': '<p>Original evidence.</p>',
         })
-        run = self.Run.create(dict(self.values('existing-snapshot'), existing_slide_id=slide.id))
+        run = self.Run.create(dict(self.values('existing-snapshot'), existing_slide_id=slide.id,
+                                   raw_content='Original evidence.'))
         slide.write({'html_content': '<p>Changed evidence.</p>'})
         self.assertFalse(run.action_execute_pipeline())
         self.assertEqual(run.error_message, 'CANONICAL_INPUT_CHANGED')
