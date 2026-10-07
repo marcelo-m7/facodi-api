@@ -250,7 +250,7 @@ class TestPipelineSecurity(TransactionCase):
                                  raw_content='Unrelated caller content.'))
 
     def test_publication_replay_rejects_changed_canonical_slide(self):
-        self.operator.write({'group_ids': [Command.link(self.env.ref('website_slides.group_website_slides_officer').id)]})
+        self.operator.write({'group_ids': [Command.link(self.env.ref('facodi_api.group_pipeline_reviewer').id)]})
         slide = self.env['slide.slide'].with_user(self.operator).create({
             'name': 'Replay original', 'channel_id': self.channel.id,
             'slide_category': 'article', 'html_content': '<p>Original replay evidence.</p>',
