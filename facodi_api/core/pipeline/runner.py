@@ -42,7 +42,14 @@ class PipelineRunner:
         self.normalizer = ContentNormalizer()
         self.enrichment_provider = enrichment_provider or BaselineDeterministicProvider()
         self.mapper = CurriculumMapper()
-        self.storage_dir = storage_dir or os.path.join(os.getcwd(), ".facodi_pipeline_runs")
+        if storage_dir:
+            self.storage_dir = storage_dir
+        elif os.getenv("FACODI_PIPELINE_RUNS_DIR"):
+            self.storage_dir = os.environ["FACODI_PIPELINE_RUNS_DIR"]
+        else:
+            # Fallback safely to /tmp or user cache rather than root /
+            base_dir = os.getenv("XDG_CACHE_HOME") or "/tmp"
+            self.storage_dir = os.path.join(base_dir, "facodi_pipeline_runs")
         os.makedirs(self.storage_dir, exist_ok=True)
 
     def _get_run_path(self, run_id: str) -> str:
