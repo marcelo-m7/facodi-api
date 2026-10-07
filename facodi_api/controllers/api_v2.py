@@ -36,60 +36,78 @@ class FacodiApiV2Controller(http.Controller):
     @http.route("/facodi/api/v2/pipeline/runs", type="http", auth="public", methods=["POST"], csrf=False)
     def create_pipeline_run(self, **kwargs):
         """Submit a content item for ingestion and processing. Responds 202 Accepted asynchronously."""
-        self._check_auth()
-        data = request.get_json_data(silent=True) or {}
-        idempotency_key = (
-            request.httprequest.headers.get("Idempotency-Key")
-            or data.get("idempotency_key")
-        )
+        try:
+            self._check_auth()
+            data = None
+            try:
+                data = request.get_json_data()
+            except Exception:
+                try:
+                    raw_body = request.httprequest.get_data(as_text=True)
+                    if raw_body:
+                        data = json.loads(raw_body)
+                except Exception:
+                    data = {}
+            if not isinstance(data, dict):
+                data = {}
 
-        source_type = data.get("source_type", "document")
-        url = data.get("url")
-        title = data.get("title")
-        raw_content = data.get("raw_content")
-        language = data.get("language", "pt")
-        execute_sync = data.get("sync", False)
+            idempotency_key = (
+                request.httprequest.headers.get("Idempotency-Key")
+                or data.get("idempotency_key")
+            )
 
-        # Check existing if idempotency_key is present
-        RunModel = request.env["facodi.pipeline.run"].sudo()
-        if idempotency_key:
-            existing = RunModel.search([("idempotency_key", "=", idempotency_key)], limit=1)
-            if existing:
-                resp = {
-                    "run_id": existing.run_id,
-                    "idempotency_key": existing.idempotency_key,
-                    "status": existing.status,
-                    "created_at": existing.create_date.isoformat() if existing.create_date else None,
-                }
-                return Response(json.dumps(resp), status=200, mimetype="application/json")
+            source_type = data.get("source_type", "document")
+            url = data.get("url")
+            title = data.get("title")
+            raw_content = data.get("raw_content")
+            language = data.get("language", "pt")
+            execute_sync = data.get("sync", False)
 
-        run_record = RunModel.create({
-            "name": title or f"Run {idempotency_key or str(uuid.uuid4())[:8]}",
-            "run_id": str(uuid.uuid4()),
-            "idempotency_key": idempotency_key,
-            "source_type": source_type,
-            "source_url": url,
-            "title": title,
-            "raw_content": raw_content,
-            "language": language,
-            "status": "received",
-        })
+            # Check existing if idempotency_key is present
+            RunModel = request.env["facodi.pipeline.run"].sudo()
+            if idempotency_key:
+                existing = RunModel.search([("idempotency_key", "=", idempotency_key)], limit=1)
+                if existing:
+                    resp = {
+                        "run_id": existing.run_id,
+                        "idempotency_key": existing.idempotency_key,
+                        "status": existing.status,
+                        "created_at": existing.create_date.isoformat() if existing.create_date else None,
+                    }
+                    return Response(json.dumps(resp), status=200, mimetype="application/json")
 
-        if execute_sync:
-            run_record.action_execute_pipeline()
-            status_code = 200
-        else:
-            status_code = 202
+            run_record = RunModel.create({
+                "name": title or f"Run {idempotency_key or str(uuid.uuid4())[:8]}",
+                "run_id": str(uuid.uuid4()),
+                "idempotency_key": idempotency_key,
+                "source_type": source_type,
+                "source_url": url,
+                "title": title,
+                "raw_content": raw_content,
+                "language": language,
+                "status": "received",
+            })
 
-        resp = {
-            "run_id": run_record.run_id,
-            "idempotency_key": run_record.idempotency_key,
-            "status": run_record.status,
-            "links": {
-                "self": f"/facodi/api/v2/pipeline/runs/{run_record.run_id}",
-            },
-        }
-        return Response(json.dumps(resp), status=status_code, mimetype="application/json")
+            if execute_sync:
+                run_record.action_execute_pipeline()
+                status_code = 200
+            else:
+                status_code = 202
+
+            resp = {
+                "run_id": run_record.run_id,
+                "idempotency_key": run_record.idempotency_key,
+                "status": run_record.status,
+                "links": {
+                    "self": f"/facodi/api/v2/pipeline/runs/{run_record.run_id}",
+                },
+            }
+            return Response(json.dumps(resp), status=status_code, mimetype="application/json")
+        except Forbidden as e:
+            return Response(json.dumps({"error": str(e)}), status=403, mimetype="application/json")
+        except Exception as e:
+            _logger.exception("Error creating pipeline run: %s", e)
+            return Response(json.dumps({"error": str(e), "type": type(e).__name__}), status=500, mimetype="application/json")
 
     @http.route("/facodi/api/v2/pipeline/runs/<string:run_id>", type="http", auth="public", methods=["GET"], csrf=False)
     def get_pipeline_run(self, run_id, **kwargs):
