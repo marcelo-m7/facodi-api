@@ -45,7 +45,7 @@ class PipelineRunner:
         self.normalizer = ContentNormalizer()
         self.enrichment_provider = enrichment_provider or BaselineDeterministicProvider()
         self.mapper = CurriculumMapper()
-        self.storage_dir = storage_dir or os.path.join(os.getcwd(), ".facodi_pipeline_runs")
+        self.storage_dir = storage_dir or os.getenv("FACODI_PIPELINE_RUNS_DIR") or os.path.join(os.getenv("XDG_CACHE_HOME") or "/tmp", "facodi_pipeline_runs")
         os.makedirs(self.storage_dir, exist_ok=True)
 
     def _get_run_path(self, run_id: str) -> str:
