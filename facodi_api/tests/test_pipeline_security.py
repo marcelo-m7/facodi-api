@@ -22,7 +22,7 @@ class TestPipelineSecurity(TransactionCase):
             'group_ids': [Command.set([cls.env.ref('facodi_api.group_pipeline_operator').id])],
         })
         cls.channel = cls.env['slide.channel'].create({
-            'name': 'Security course', 'user_id': cls.operator.id,
+            'name': 'Security course', 'user_id': cls.operator.id, 'website_published': True,
             'website_id': cls.env['website'].search([('company_id', '=', cls.env.company.id)], limit=1).id,
         })
         cls.Run = cls.env['facodi.pipeline.run'].with_user(cls.operator)
@@ -37,11 +37,27 @@ class TestPipelineSecurity(TransactionCase):
             with self.assertRaises(AccessError):
                 self.Run.create(dict(self.values(field), **{field: value}))
 
+    def test_context_defaults_cannot_forge_generated_fields(self):
+        run = self.Run.with_context(
+            default_status='published', default_metadata_json='{"forged": true}',
+            default_reviewed_by_id=self.operator.id, default_reviewed_at='2026-10-07 10:00:00',
+            default_legacy_quarantined=True, default_published_slide_id=123456,
+            default_project_id=123456, default_task_id=123456,
+        ).create(self.values())
+        self.assertEqual(run.status, 'received')
+        self.assertFalse(run.metadata_json)
+        self.assertFalse(run.reviewed_by_id)
+        self.assertFalse(run.reviewed_at)
+        self.assertFalse(run.published_slide_id)
+        self.assertFalse(run.legacy_quarantined)
+        self.assertNotEqual(run.task_id.id, 123456)
+        self.assertNotEqual(run.project_id.id, 123456)
+
     def test_write_rejects_generated_and_accepted_fields(self):
         run = self.Run.create(self.values())
         for field, value in [('status', 'published'), ('metadata_json', '{}'),
                              ('target_channel_id', self.channel.id), ('raw_content', 'replaced'),
-                             ('reviewed_by_id', self.operator.id), ('company_id', self.env.company.id)]:
+                             ('reviewed_by_id', self.operator.id), ('company_id', self.env.company.id), ('create_uid', self.env.user.id)]:
             with self.assertRaises(AccessError):
                 run.with_context(facodi_pipeline_internal=True).write({field: value})
         self.assertEqual(run.status, 'received')
@@ -81,3 +97,18 @@ class TestPipelineSecurity(TransactionCase):
         run._set_execution_values({'status': 'waiting_review'})
         with self.assertRaises(UserError):
             run.action_execute_pipeline()
+
+    def test_archived_course_does_not_starve_the_next_queue_run(self):
+        first = self.Run.create(self.values('archived'))
+        other_channel = self.env['slide.channel'].create({
+            'name': 'Next valid course', 'user_id': self.operator.id,
+            'website_id': self.channel.website_id.id, 'website_published': True,
+        })
+        second = self.Run.create(dict(self.values('next-valid'), target_channel_id=other_channel.id))
+        self.channel.active = False
+        self.env['facodi.pipeline.run'].cron_process_received_runs()
+        first.invalidate_recordset()
+        self.assertEqual(first.status, 'failed')
+        self.env['facodi.pipeline.run'].cron_process_received_runs()
+        second.invalidate_recordset()
+        self.assertEqual(second.status, 'waiting_review')

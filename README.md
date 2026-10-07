@@ -15,15 +15,15 @@ Run the addon contract tests with:
 python3 -m unittest discover -s facodi_api/tests -v
 ```
 
-## Proposed Python content pipeline
+## Isolated Python content pipeline v2
 
-A complete development proposal for a Python pipeline inside this addon, with capability endpoints and standard Odoo Project tasks, is available in [docs/facodi-api](docs/facodi-api/README.md). This is planned behavior; the existing provider bridge is unchanged by the documentation delivery.
+A complete development proposal for a Python pipeline inside this addon, with capability endpoints and standard Odoo Project tasks, is available in [docs/facodi-api](docs/facodi-api/README.md). The addon implements gated asynchronous intake, review and canonical publication. The existing provider bridge and legacy platform consumers remain active. See [current review and operational evidence](docs/facodi-api/review-integration-2026-10-07.md) before enabling v2.
 
 - Engineering epic: https://github.com/marcelo-m7/facodi-api/issues/1
 - Deployment integration epic: https://github.com/marcelo-m7/facodi-deploy/issues/255
 - [Implementation plan](docs/superpowers/plans/2026-10-06-facodi-api.md)
 
-The current provider tests live in facodi_api/tests (the tests/ directory is proposed for future pure service tests). For the current checkout use:
+Pure pipeline tests run with `PYTHONPATH=. pytest -q`. ORM tests run in the real Odoo registry through the isolated deploy CI. Provider contract tests also support:
 
 ```bash
 python3 -m unittest discover -s facodi_api/tests -v

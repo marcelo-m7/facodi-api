@@ -3,46 +3,38 @@ from __future__ import annotations
 import re
 import urllib.parse
 import uuid
-import time
-import requests
 from ..contracts.dtos import ContentDocument, SourceType, TranscriptSegment, utc_now_iso
 
-class YouTubeAcquisitionError(ValueError):
-    def __init__(self, code="YOUTUBE_UNAVAILABLE"):
-        self.code = code
-        super().__init__(code)
+from pathlib import Path
+import json
+import subprocess
+import sys
+from .youtube_transport import YouTubeAcquisitionError
+
+_WORKER_SCRIPT = Path(__file__).with_name('youtube_transport.py')
 
 
-class BoundedTranscriptSession(requests.Session):
-    """No retries; bound each request and the adapter's overall acquisition budget."""
-    def __init__(self, budget_seconds=45):
-        super().__init__()
-        self.deadline = time.monotonic() + budget_seconds
-
-    def request(self, method, url, **kwargs):
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
-            raise YouTubeAcquisitionError("YOUTUBE_TIMEOUT")
-        kwargs["timeout"] = (min(5, remaining), min(10, remaining))
-        kwargs["stream"] = True
-        response = super().request(method, url, **kwargs)
-        content = bytearray()
-        try:
-            for chunk in response.iter_content(65536):
-                if time.monotonic() > self.deadline:
-                    raise YouTubeAcquisitionError("YOUTUBE_TIMEOUT")
-                content.extend(chunk)
-                if len(content) > 4 * 1024 * 1024:
-                    raise YouTubeAcquisitionError("YOUTUBE_RESPONSE_TOO_LARGE")
-            response._content = bytes(content)
-            response._content_consumed = True
-        except Exception:
-            response.close()
-            raise
-        if time.monotonic() > self.deadline:
-            response.close()
-            raise YouTubeAcquisitionError("YOUTUBE_TIMEOUT")
-        return response
+def acquire_transcript(video_id, language, *, budget_seconds=45):
+    """OS-enforced deadline: terminate the child even on redirect/trickle stalls."""
+    try:
+        result = subprocess.run(
+            [sys.executable, str(_WORKER_SCRIPT)],
+            input=json.dumps({'video_id': video_id, 'language': language}),
+            capture_output=True, text=True, timeout=budget_seconds, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise YouTubeAcquisitionError('YOUTUBE_TIMEOUT') from None
+    except OSError:
+        raise YouTubeAcquisitionError('YOUTUBE_TRANSPORT_UNAVAILABLE') from None
+    if result.returncode or len(result.stdout.encode('utf-8')) > 2 * 1024 * 1024:
+        raise YouTubeAcquisitionError()
+    try:
+        payload = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        raise YouTubeAcquisitionError() from None
+    if payload.get('error'):
+        raise YouTubeAcquisitionError(payload['error'])
+    return payload
 
 
 class YouTubeIngestionAdapter:
@@ -97,33 +89,11 @@ class YouTubeIngestionAdapter:
         else:
             if not video_id:
                 raise ValueError('Invalid YouTube URL')
-            try:
-                from youtube_transcript_api import YouTubeTranscriptApi
-                with BoundedTranscriptSession() as session:
-                    available = YouTubeTranscriptApi(http_client=session).list(video_id)
-                    transcript = available.find_transcript([language, 'en', 'es'])
-                    language = transcript.language_code
-                    metadata['is_generated'] = transcript.is_generated
-                    size = 0
-                    for item in transcript.fetch():
-                        get = item.get if isinstance(item, dict) else lambda key, default=None: getattr(item, key, default)
-                        value = str(get('text', '')).strip()
-                        size += len(value.encode('utf-8'))
-                        if len(segments) >= self.MAX_SEGMENTS or size > self.MAX_TRANSCRIPT_BYTES:
-                            raise YouTubeAcquisitionError("YOUTUBE_TRANSCRIPT_TOO_LARGE")
-                        segments.append(TranscriptSegment(float(get('start', 0)), float(get('duration', 0)), value))
-            except YouTubeAcquisitionError:
-                raise
-            except requests.Timeout:
-                raise YouTubeAcquisitionError("YOUTUBE_TIMEOUT") from None
-            except Exception as exc:
-                code = {
-                    "IpBlocked": "YOUTUBE_IP_BLOCKED", "RequestBlocked": "YOUTUBE_IP_BLOCKED",
-                    "TranscriptsDisabled": "YOUTUBE_TRANSCRIPTS_DISABLED",
-                    "NoTranscriptFound": "YOUTUBE_LANGUAGE_UNAVAILABLE",
-                    "VideoUnavailable": "YOUTUBE_VIDEO_UNAVAILABLE",
-                }.get(type(exc).__name__, "YOUTUBE_UNAVAILABLE")
-                raise YouTubeAcquisitionError(code) from None
+            payload = acquire_transcript(video_id, language)
+            language = payload['language']
+            metadata['is_generated'] = payload['is_generated']
+            for item in payload['segments']:
+                segments.append(TranscriptSegment(item['start'], item['duration'], item['text']))
             if not segments or not any(segment.text for segment in segments):
                 raise YouTubeAcquisitionError()
             text = ' '.join(segment.text for segment in segments)

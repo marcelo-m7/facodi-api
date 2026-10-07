@@ -35,3 +35,16 @@ def test_terminated_stream_remains_bounded():
 def test_unterminated_body_without_length_is_rejected():
     with pytest.raises(http_input.InvalidPayload):
         http_input.read_request_object(io.BytesIO(b'{}'), None)
+
+
+def test_hard_deadline_terminates_a_stalled_real_child(tmp_path, monkeypatch):
+    import time
+    from facodi_api.core.ingestion import youtube
+    worker = tmp_path / 'stalled_transport.py'
+    worker.write_text('import time\ntime.sleep(60)\n')
+    monkeypatch.setattr(youtube, '_WORKER_SCRIPT', worker)
+    started = time.monotonic()
+    with pytest.raises(youtube.YouTubeAcquisitionError) as error:
+        youtube.acquire_transcript('dQw4w9WgXcQ', 'en', budget_seconds=0.2)
+    assert error.value.code == 'YOUTUBE_TIMEOUT'
+    assert time.monotonic() - started < 2

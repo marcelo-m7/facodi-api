@@ -87,6 +87,9 @@ def test_current_transcript_api_attribute_snippets(monkeypatch):
         setattr(errors, name, type(name, (Exception,), {}))
     monkeypatch.setitem(sys.modules, "youtube_transcript_api", module)
     monkeypatch.setitem(sys.modules, "youtube_transcript_api._errors", errors)
+    from facodi_api.core.ingestion.youtube_transport import fetch_transcript
+    payload = fetch_transcript("dQw4w9WgXcQ", "pt")
+    monkeypatch.setattr("facodi_api.core.ingestion.youtube.acquire_transcript", lambda *_: payload)
     doc = YouTubeIngestionAdapter().ingest(ContentSource(source_type=SourceType.YOUTUBE,
         url="https://youtu.be/dQw4w9WgXcQ", language="pt"))
     assert len(doc.segments) == 1
@@ -101,7 +104,10 @@ def test_empty_document_is_not_success():
 
 
 def test_missing_transcript_is_not_success(tmp_path, monkeypatch):
-    monkeypatch.setitem(sys.modules, "youtube_transcript_api", None)
+    from facodi_api.core.ingestion.youtube import YouTubeAcquisitionError
+    def unavailable(*args):
+        raise YouTubeAcquisitionError()
+    monkeypatch.setattr("facodi_api.core.ingestion.youtube.acquire_transcript", unavailable)
     runner = PipelineRunner(storage_dir=str(tmp_path))
     with pytest.raises(ValueError):
         runner.run_pipeline(ContentSource(source_type=SourceType.YOUTUBE,

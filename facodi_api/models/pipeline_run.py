@@ -181,13 +181,15 @@ class FacodiPipelineRun(models.Model):
                 "name": vals["name"] or vals["title"] or "Content intake",
             })
             prepared.append(vals)
-        runs = super().create(prepared)
+        clean_context = {key: value for key, value in self.env.context.items() if not key.startswith("default_")}
+        trusted_model = self.with_context(clean_context)
+        runs = super(FacodiPipelineRun, trusted_model).create(prepared)
         for run in runs:
             run._ensure_project_task()
         return runs
 
     def write(self, vals):
-        if self._reserved_fields.intersection(vals):
+        if set(vals) - {"name"}:
             raise AccessError("Accepted input and generated workflow fields are immutable through RPC.")
         return super().write(vals)
 
@@ -347,9 +349,12 @@ class FacodiPipelineRun(models.Model):
             [self.id],
         )
         self.invalidate_recordset()
+        self._authorize_channel(self.target_channel_id, self.company_id, self.website_id, publication=True)
         if self.published_slide_id:
-            if self.published_slide_id.channel_id != self.target_channel_id:
-                raise UserError("Published content does not match the authorized course.")
+            if (self.published_slide_id.channel_id != self.target_channel_id
+                    or not self.published_slide_id.is_published
+                    or not self.published_slide_id.website_published):
+                raise UserError("Publication receipt requires reconciliation with the canonical course/content.")
             return True
         if self.legacy_quarantined or self.status != "waiting_review":
             raise UserError("Only runs waiting for review can be published.")
@@ -424,6 +429,8 @@ class FacodiPipelineRun(models.Model):
                 with self.env.cr.savepoint():
                     run.with_user(run.owner_id).with_context(allowed_company_ids=[run.company_id.id]).with_company(run.company_id).action_execute_pipeline()
             except Exception:
-                _logger.error("Error processing run %s in cron", run.id, exc_info=False)
+                run.invalidate_recordset()
+                run.sudo()._set_execution_values({"status": "failed", "error_message": "PIPELINE_AUTHORIZATION_CHANGED"})
+                _logger.error("Queue run failed run=%s code=PIPELINE_AUTHORIZATION_CHANGED", run.run_id, exc_info=False)
 
         return True
