@@ -38,7 +38,6 @@ class ProviderContractTest(unittest.TestCase):
             {
                 "SUPABASE_URL": "https://example.supabase.co",
                 "SUPABASE_SECRET_KEY": "sb_secret_test",
-                "FACODI_SUPABASE_VIDEO_INGEST_FUNCTION": "v2_ingest_youtube_video",
             },
             clear=False,
         ), mock.patch(ROOT_MODULE + ".provider.supabase.requests.post", return_value=FakeResponse({"ok": True})) as request_mock:
@@ -51,24 +50,33 @@ class ProviderContractTest(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         request_mock.assert_called_once()
         endpoint = request_mock.call_args.args[0]
-        self.assertEqual(endpoint, "https://example.supabase.co/functions/v1/v2_ingest_youtube_video")
+        self.assertEqual(endpoint, "https://example.supabase.co/functions/v1/v3_ingest_youtube_video")
         headers = request_mock.call_args.kwargs["headers"]
         self.assertEqual(headers["apikey"], "sb_secret_test")
         self.assertNotIn("Authorization", headers)
 
-    def test_supabase_video_ingest_requires_explicit_function(self):
+    def test_supabase_video_ingest_allows_explicit_compatibility_override(self):
         with mock.patch.dict(
             os.environ,
             {
                 "SUPABASE_URL": "https://example.supabase.co",
                 "SUPABASE_SECRET_KEY": "sb_secret_test",
+                "FACODI_SUPABASE_VIDEO_INGEST_FUNCTION": "v2_ingest_youtube_video",
             },
             clear=True,
-        ):
-            with self.assertRaisesRegex(
-                RuntimeError, "video ingest function is not configured"
-            ):
-                FacodiApiService.ingest_video({"url": "https://www.youtube.com/watch?v=abc123"})
+        ), mock.patch(
+            ROOT_MODULE + ".provider.supabase.requests.post",
+            return_value=FakeResponse({"success": True}),
+        ) as request_mock:
+            result = FacodiApiService.ingest_video(
+                {"url": "https://www.youtube.com/watch?v=SNma-fAeMzA"}
+            )
+
+        self.assertEqual(result, {"success": True})
+        self.assertEqual(
+            request_mock.call_args.args[0],
+            "https://example.supabase.co/functions/v1/v2_ingest_youtube_video",
+        )
 
     def test_supabase_uses_project_default_functions(self):
         with mock.patch.dict(
