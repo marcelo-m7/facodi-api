@@ -405,7 +405,11 @@ class FacodiPipelineRun(models.Model):
             "user_id": self.env.user.id,
         }
         if self.source_type == "youtube":
-            slide_values.update({"slide_category": "video", "source_type": "external", "video_url": self.source_url})
+            slide_values.update({
+                "slide_category": "video", "source_type": "external",
+                "video_url": self.source_url, "html_content": False,
+                "description": html_content,
+            })
         publication_context = {
             key: value for key, value in self.env.context.items()
             if not key.startswith("default_")
