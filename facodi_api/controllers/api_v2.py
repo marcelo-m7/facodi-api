@@ -43,9 +43,20 @@ class FacodiApiV2Controller(http.Controller):
             raise UnsupportedMediaType("Content-Type must be application/json")
         if request.httprequest.content_length and request.httprequest.content_length > 262144:
             raise RequestEntityTooLarge("Payload too large")
-        request.httprequest.max_content_length = 262144
-        try:
+        max_bytes = 262144
+        content_length = request.httprequest.content_length
+        if content_length is not None and content_length > max_bytes:
+            raise RequestEntityTooLarge("Payload too large")
+        wsgi_input = request.httprequest.environ.get("wsgi.input")
+        if wsgi_input is not None:
+            chunk = wsgi_input.read(max_bytes + 1)
+            if len(chunk) > max_bytes:
+                raise RequestEntityTooLarge("Payload too large")
+            body = chunk
+        else:
+            request.httprequest.max_content_length = max_bytes
             body = request.httprequest.get_data(cache=False)
+        try:
             data = read_json_object(io.BytesIO(body))
         except PayloadTooLarge:
             raise RequestEntityTooLarge("Payload too large") from None

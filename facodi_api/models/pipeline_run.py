@@ -211,6 +211,16 @@ class FacodiPipelineRun(models.Model):
             "user_ids": [(4, owner.id)],
         })
         task.message_subscribe(partner_ids=[owner.partner_id.id])
+        # Ensure subtasks for execution stages
+        stages = [("Ingestão & Validação", 1), ("Processamento & Enriquecimento", 2), ("Revisão & Aprovação", 3)]
+        for stage_name, seq in stages:
+            self.env["project.task"].sudo().create({
+                "name": f"Etapa {seq}: {stage_name}",
+                "project_id": project.id,
+                "parent_id": task.id,
+                "user_ids": [(4, owner.id)],
+                "sequence": seq,
+            })
         self.write({"project_id": project.id, "task_id": task.id})
 
     def action_approve_and_publish(self):
@@ -277,11 +287,21 @@ class FacodiPipelineRun(models.Model):
 
     @api.model
     def cron_process_received_runs(self):
-        """Cron job to process newly received background pipeline requests."""
+        """Cron job to process newly received background pipeline requests with exclusive row lock."""
         enabled = self.env["ir.config_parameter"].sudo().get_param("facodi_api.pipeline_enabled", "false")
         if enabled.lower() not in ("true", "1"):
             return
-        runs = self.search([("status", "=", "received")], order="id", limit=10)
+        self.env.cr.execute(
+            """SELECT id FROM facodi_pipeline_run
+               WHERE status = 'received'
+               ORDER BY id
+               LIMIT 10
+               FOR UPDATE SKIP LOCKED"""
+        )
+        row_ids = [row[0] for row in self.env.cr.fetchall()]
+        if not row_ids:
+            return
+        runs = self.browse(row_ids)
         for run in runs:
             try:
                 run.with_user(run.owner_id).action_execute_pipeline()
