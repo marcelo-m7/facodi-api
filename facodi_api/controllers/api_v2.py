@@ -32,7 +32,7 @@ class FacodiApiV2Controller(http.Controller):
             raise Forbidden("Pipeline reviewer access is required.")
         return True
 
-    @http.route("/facodi/api/v2/pipeline/runs", type="http", auth="bearer", methods=["POST"], csrf=False, max_content_length=262144)
+    @http.route("/facodi/api/v2/pipeline/runs", type="http", auth="bearer", methods=["POST"], csrf=False, max_content_length=262145)
     def create_pipeline_run(self, **kwargs):
         """Submit a content item for ingestion and processing. Responds 202 Accepted asynchronously."""
         self._check_auth()
@@ -40,8 +40,9 @@ class FacodiApiV2Controller(http.Controller):
             raise UnsupportedMediaType("Content-Type must be application/json")
         try:
             # Odoo 19 exposes get_data, but deliberately hides the WSGI stream.
-            # Werkzeug enforces this limit for Content-Length and chunked bodies.
-            request.httprequest.max_content_length = 262144
+            # One sentinel byte detects oversized chunked bodies even when
+            # Werkzeug returns a prefix at the configured limit.
+            request.httprequest.max_content_length = 262145
             body = request.httprequest.get_data(cache=False)
             data = read_request_object(io.BytesIO(body), len(body), terminated=True)
         except PayloadTooLarge:
