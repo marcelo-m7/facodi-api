@@ -71,19 +71,7 @@ class DocumentIngestionAdapter:
             file_bytes = source.raw_content.encode("utf-8")
 
         if not file_bytes:
-            warnings.append("Document source provided no file bytes or raw content.")
-            return ContentDocument(
-                id=doc_id,
-                source_type=SourceType.DOCUMENT,
-                title=title,
-                text_content="",
-                markdown_content="",
-                language=source.language or "pt",
-                source_url=source.url,
-                warnings=warnings,
-                input_hash=source.compute_hash(),
-                acquired_at=utc_now_iso(),
-            )
+            raise ValueError("Document source has no content")
 
         if len(file_bytes) > self.MAX_FILE_SIZE_BYTES:
             raise ValueError(
@@ -140,6 +128,9 @@ class DocumentIngestionAdapter:
                     text_content = file_bytes.decode("latin-1", errors="replace")
                     markdown_content = text_content
                     warnings.append("Decoded using latin-1 fallback due to utf-8 decode error.")
+
+        if not text_content.strip():
+            raise ValueError("Document extraction produced no content")
 
         if not source.title and markdown_content:
             first_lines = [l.strip("# ").strip() for l in markdown_content.splitlines() if l.strip()]

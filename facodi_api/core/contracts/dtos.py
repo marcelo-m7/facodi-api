@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
@@ -64,6 +65,11 @@ class TranscriptSegment:
     duration: float
     text: str
 
+    def __post_init__(self):
+        for value in (self.start, self.duration):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError("Transcript timing must be finite and nonnegative")
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -90,10 +96,12 @@ class ContentSource:
     schema_version: str = "2.0.0"
 
     def compute_hash(self) -> str:
-        payload = f"{self.source_type.value}:{self.url or ''}:{self.raw_content or ''}:{self.raw_file_name or ''}"
-        if self.raw_file_bytes:
-            payload += f":{compute_sha256(self.raw_file_bytes)}"
-        return compute_sha256(payload)
+        payload = {"source_type": self.source_type.value, "url": self.url,
+                   "raw_content": self.raw_content, "filename": self.raw_file_name,
+                   "file_hash": compute_sha256(self.raw_file_bytes) if self.raw_file_bytes else None,
+                   "title": self.title, "language": self.language,
+                   "metadata": self.metadata, "schema_version": self.schema_version}
+        return compute_sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False))
 
     def to_dict(self) -> Dict[str, Any]:
         d = {

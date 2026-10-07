@@ -34,6 +34,7 @@ class FacodiPipelineRun(models.Model):
     name = fields.Char(string="Run Reference", required=True, default=lambda self: str(uuid.uuid4())[:8], tracking=True)
     run_id = fields.Char(string="Run UUID", required=True, index=True, default=lambda self: str(uuid.uuid4()))
     idempotency_key = fields.Char(string="Idempotency Key", index=True)
+    request_hash = fields.Char(readonly=True)
     source_type = fields.Selection(
         [
             ("youtube", "YouTube Video"),
@@ -85,6 +86,7 @@ class FacodiPipelineRun(models.Model):
     def action_execute_pipeline(self):
         """Execute the pure Python pipeline runner and update record state."""
         self.ensure_one()
+        self._check_pipeline_enabled()
         if self.status in ["running", "published"]:
             return
 
@@ -116,7 +118,7 @@ class FacodiPipelineRun(models.Model):
                         )
                     )
         except Exception:
-            _logger.warning("Could not load slide.channel for catalog snapshot", exc_info=True)
+            _logger.warning("Could not load slide.channel for catalog snapshot", exc_info=False)
 
         catalog = CatalogSnapshot(
             snapshot_id=f"snap-{self.id}",
@@ -124,7 +126,7 @@ class FacodiPipelineRun(models.Model):
             targets=targets,
         )
 
-        runner = PipelineRunner()
+        runner = PipelineRunner(storage_dir=os.path.join(os.environ.get("FACODI_PIPELINE_STORAGE", "/tmp/facodi-pipeline-v2"), self.env.cr.dbname, str(self.id)))
         try:
             res_run = runner.run_pipeline(
                 source=source,
@@ -144,10 +146,10 @@ class FacodiPipelineRun(models.Model):
             _logger.exception("Pipeline execution failed for run %s", self.id)
             self.write({
                 "status": "failed",
-                "error_message": str(e),
+                "error_message": "Pipeline execution failed",
             })
             if self.task_id:
-                self.task_id.message_post(body=f"Falha na execução do pipeline: {str(e)}")
+                self.task_id.message_post(body="Falha na execução do pipeline.")
 
     def _sync_to_project_task(self):
         """Create or update a mirrored task in project.project / project.task."""
@@ -201,19 +203,24 @@ class FacodiPipelineRun(models.Model):
     def action_approve_and_publish(self):
         """Manager review action to publish content into target catalog or course."""
         self.ensure_one()
-        if self.status != "waiting_review":
-            raise UserError("Apenas execuções em estado 'Aguardando Revisão' podem ser aprovadas.")
+        raise UserError("Publicação indisponível: o adaptador transacional ainda não foi implementado.")
 
-        self.write({"status": "published"})
-        if self.task_id:
-            self.task_id.message_post(body="Conteúdo aprovado e publicado pelo gestor.")
+    def _check_pipeline_enabled(self):
+        enabled = self.env["ir.config_parameter"].sudo().get_param("facodi_api.pipeline_enabled", "false")
+        if enabled.lower() not in ("true", "1"):
+            raise UserError("Pipeline isolado desativado.")
+        if not self.env.user.has_group("base.group_system"):
+            raise UserError("Acesso restrito a administradores durante a fase de isolamento.")
 
     @api.model
     def cron_process_received_runs(self):
         """Cron job to process newly received background pipeline requests."""
+        enabled = self.env["ir.config_parameter"].sudo().get_param("facodi_api.pipeline_enabled", "false")
+        if enabled.lower() not in ("true", "1"):
+            return
         runs = self.search([("status", "=", "received")], limit=10)
         for run in runs:
             try:
                 run.action_execute_pipeline()
             except Exception:
-                _logger.error("Error processing run %s in cron", run.id, exc_info=True)
+                _logger.error("Error processing run %s in cron", run.id, exc_info=False)

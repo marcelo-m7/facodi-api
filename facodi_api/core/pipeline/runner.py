@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
+import tempfile
 import json
 import logging
 import os
@@ -46,13 +49,26 @@ class PipelineRunner:
         os.makedirs(self.storage_dir, exist_ok=True)
 
     def _get_run_path(self, run_id: str) -> str:
-        return os.path.join(self.storage_dir, f"{run_id}.json")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run_id):
+            raise ValueError("Invalid run identifier")
+        path = os.path.join(self.storage_dir, f"{run_id}.json")
+        if os.path.islink(path):
+            raise ValueError("Invalid run identifier: symlink")
+        return path
 
     def save_run(self, run: PipelineRun) -> None:
         """Persist pipeline run state to JSON artifact storage."""
         path = self._get_run_path(run.run_id)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(run.to_dict(), f, indent=2, ensure_ascii=False)
+        fd, temporary = tempfile.mkstemp(dir=self.storage_dir, prefix=".run-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(run.to_dict(), f, indent=2, ensure_ascii=False, allow_nan=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def load_run(self, run_id: str) -> Optional[PipelineRun]:
         """Load pipeline run from disk."""
@@ -70,10 +86,13 @@ class PipelineRunner:
         idempotency_key: Optional[str] = None,
     ) -> PipelineRun:
         """Execute all steps idempotently."""
-        run_id = idempotency_key or str(uuid.uuid4())
+        run_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "facodi-api-v2:" + idempotency_key)) if idempotency_key else str(uuid.uuid4())
+        fingerprint = hashlib.sha256(json.dumps({"source": source.compute_hash(), "catalog": catalog.to_dict() if catalog else None, "provider": type(self.enrichment_provider).__module__ + "." + type(self.enrichment_provider).__name__, "pipeline_version": "2.0.1"}, sort_keys=True, allow_nan=False).encode()).hexdigest()
         
         # Check if already completed under this idempotency_key
         existing = self.load_run(run_id)
+        if existing and existing.metadata.get("input_fingerprint") != fingerprint:
+            raise ValueError("Idempotency conflict: processing inputs changed")
         if existing and existing.status == RunStatus.SUCCEEDED:
             logger.info("Run %s already completed (idempotency hit)", run_id)
             return existing
@@ -94,6 +113,7 @@ class PipelineRunner:
             created_at=now,
             updated_at=now,
             steps=steps,
+            metadata={"input_fingerprint": fingerprint},
         )
         self.save_run(run)
 
@@ -229,8 +249,8 @@ class PipelineRunner:
             return run
 
         except Exception as exc:
-            logger.exception("Pipeline run %s failed", run_id)
-            err_dict = {"code": "pipeline_execution_error", "message": str(exc)}
+            logger.warning("Pipeline run %s failed (%s)", run_id, type(exc).__name__)
+            err_dict = {"code": "pipeline_execution_error", "message": "Pipeline execution failed"}
             failed_steps = []
             for s in steps:
                 if s.status == StepStatus.RUNNING or s.status == StepStatus.PENDING:
@@ -239,7 +259,7 @@ class PipelineRunner:
                             step_key=s.step_key,
                             name=s.name,
                             status=StepStatus.FAILED,
-                            error_message=str(exc),
+                            error_message="Pipeline execution failed",
                             completed_at=utc_now_iso(),
                         )
                     )

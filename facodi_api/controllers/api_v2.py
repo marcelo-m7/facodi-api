@@ -9,7 +9,7 @@ import uuid
 
 from odoo import http
 from odoo.http import request
-from werkzeug.exceptions import BadRequest, Forbidden, NotFound
+from werkzeug.exceptions import BadRequest, Forbidden, NotFound, ServiceUnavailable, NotImplemented
 from werkzeug.wrappers import Response
 
 _logger = logging.getLogger(__name__)
@@ -20,28 +20,35 @@ class FacodiApiV2Controller(http.Controller):
 
     def _check_auth(self):
         """Validate Bearer API Token if configured."""
-        token = os.getenv("FACODI_API_BEARER_TOKEN")
-        if not token:
-            # If not configured, allow local/test access or request session
-            return True
-
-        auth_header = request.httprequest.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            raise Forbidden("Missing or invalid Authorization header.")
-        provided = auth_header.split(" ", 1)[1].strip()
-        if provided != token:
-            raise Forbidden("Invalid bearer token.")
+        # Native Odoo bearer authentication resolves the API key to a user.
+        if not request.httprequest.headers.get("Authorization", "").startswith("Bearer "):
+            raise Forbidden("An explicit bearer API key is required.")
+        enabled = request.env["ir.config_parameter"].sudo().get_param("facodi_api.pipeline_enabled", "false")
+        if enabled.lower() not in ("true", "1"):
+            raise ServiceUnavailable("The isolated pipeline is disabled.")
+        if not request.env.user.has_group("base.group_system"):
+            raise Forbidden("Pipeline access requires an administrator during the isolation phase.")
         return True
 
-    @http.route("/facodi/api/v2/pipeline/runs", type="http", auth="public", methods=["POST"], csrf=False)
+    @http.route("/facodi/api/v2/pipeline/runs", type="http", auth="bearer", methods=["POST"], csrf=False)
     def create_pipeline_run(self, **kwargs):
         """Submit a content item for ingestion and processing. Responds 202 Accepted asynchronously."""
         self._check_auth()
-        data = request.get_json_data(silent=True) or {}
+        if request.httprequest.content_length and request.httprequest.content_length > 262144:
+            raise BadRequest("Payload too large")
+        data = request.get_json_data(silent=False)
+        if not isinstance(data, dict):
+            raise BadRequest("Expected a JSON object")
+        if data.get("sync"):
+            raise BadRequest("Synchronous execution is disabled")
         idempotency_key = (
             request.httprequest.headers.get("Idempotency-Key")
             or data.get("idempotency_key")
         )
+
+        if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 128:
+            raise BadRequest("Idempotency-Key is required (1–128 characters)")
+        fingerprint = __import__("hashlib").sha256(json.dumps(data, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
         source_type = data.get("source_type", "document")
         url = data.get("url")
@@ -51,10 +58,12 @@ class FacodiApiV2Controller(http.Controller):
         execute_sync = data.get("sync", False)
 
         # Check existing if idempotency_key is present
-        RunModel = request.env["facodi.pipeline.run"].sudo()
+        RunModel = request.env["facodi.pipeline.run"]
         if idempotency_key:
             existing = RunModel.search([("idempotency_key", "=", idempotency_key)], limit=1)
             if existing:
+                if existing.request_hash != fingerprint:
+                    return Response(json.dumps({"error": "idempotency_conflict"}), status=409, mimetype="application/json")
                 resp = {
                     "run_id": existing.run_id,
                     "idempotency_key": existing.idempotency_key,
@@ -67,6 +76,7 @@ class FacodiApiV2Controller(http.Controller):
             "name": title or f"Run {idempotency_key or str(uuid.uuid4())[:8]}",
             "run_id": str(uuid.uuid4()),
             "idempotency_key": idempotency_key,
+            "request_hash": fingerprint,
             "source_type": source_type,
             "source_url": url,
             "title": title,
@@ -91,11 +101,11 @@ class FacodiApiV2Controller(http.Controller):
         }
         return Response(json.dumps(resp), status=status_code, mimetype="application/json")
 
-    @http.route("/facodi/api/v2/pipeline/runs/<string:run_id>", type="http", auth="public", methods=["GET"], csrf=False)
+    @http.route("/facodi/api/v2/pipeline/runs/<string:run_id>", type="http", auth="bearer", methods=["GET"], csrf=False)
     def get_pipeline_run(self, run_id, **kwargs):
         """Retrieve status, artifacts and curriculum mapping recommendations for a run."""
         self._check_auth()
-        RunModel = request.env["facodi.pipeline.run"].sudo()
+        RunModel = request.env["facodi.pipeline.run"]
         run = RunModel.search([("run_id", "=", run_id)], limit=1)
         if not run:
             raise NotFound(f"Run {run_id} not found.")
@@ -120,14 +130,8 @@ class FacodiApiV2Controller(http.Controller):
         }
         return Response(json.dumps(resp), status=200, mimetype="application/json")
 
-    @http.route("/facodi/api/v2/pipeline/runs/<string:run_id>/approve", type="http", auth="public", methods=["POST"], csrf=False)
+    @http.route("/facodi/api/v2/pipeline/runs/<string:run_id>/approve", type="http", auth="bearer", methods=["POST"], csrf=False)
     def approve_pipeline_run(self, run_id, **kwargs):
         """Manager approval to publish content and complete pedagogical workflow."""
         self._check_auth()
-        RunModel = request.env["facodi.pipeline.run"].sudo()
-        run = RunModel.search([("run_id", "=", run_id)], limit=1)
-        if not run:
-            raise NotFound(f"Run {run_id} not found.")
-
-        run.action_approve_and_publish()
-        return Response(json.dumps({"status": "published", "run_id": run.run_id}), status=200, mimetype="application/json")
+        raise NotImplemented("Publication adapter and transactional approval are not implemented.")
