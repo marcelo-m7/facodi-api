@@ -75,6 +75,10 @@ def generate(payload):
                 if len(content) != 1 or set(content[0]) != {'text'}:
                     raise TransportError('PROVIDER_INVALID_OUTPUT')
                 return json.loads(content[0]['text'], parse_constant=lambda value: (_ for _ in ()).throw(ValueError()))
+    except requests.Timeout:
+        raise TransportError('PROVIDER_TIMEOUT') from None
+    except requests.RequestException:
+        raise TransportError('PROVIDER_UNAVAILABLE') from None
     finally:
         session.close()
 

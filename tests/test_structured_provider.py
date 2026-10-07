@@ -3,6 +3,7 @@ import pytest
 
 from facodi_api.core.contracts.dtos import ContentDocument, ContentChunk, SourceType
 from facodi_api.core.enrichment import provider
+from facodi_api.core.enrichment import gemini_transport
 
 
 def source():
@@ -64,3 +65,20 @@ def test_provider_endpoint_and_budget_are_bounded(model, budget):
     build()
     with pytest.raises(ValueError):
         provider.GeminiStructuredProvider(model=model, max_output_tokens=budget)
+
+
+def test_transport_classifies_connection_failure_as_unavailable(monkeypatch):
+    monkeypatch.setenv('FACODI_ENRICHMENT_API_KEY', 'secret-fixture')
+    monkeypatch.setattr(
+        gemini_transport.requests.Session,
+        'post',
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            gemini_transport.requests.ConnectionError('offline')
+        ),
+    )
+    with pytest.raises(gemini_transport.TransportError, match='PROVIDER_UNAVAILABLE'):
+        gemini_transport.generate({
+            'model': 'gemini-test-fixture',
+            'max_output_tokens': 2048,
+            'chunks': [{'index': 0, 'text': 'Original evidence.'}],
+        })
