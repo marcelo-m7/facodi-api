@@ -406,30 +406,31 @@ class FacodiPipelineRun(models.Model):
         }
         if self.source_type == "youtube":
             slide_values.update({"slide_category": "video", "source_type": "external", "video_url": self.source_url})
-        # This receipt is owned by v2. Suppress the legacy learning video
-        # export hook for this creation only; this context grants no access.
-        slide = self.env["slide.slide"].with_context(
-            facodi_supabase_video_sync=True,
-        ).create(slide_values)
-        if native_review_values is not None:
-            review = self.env["facodi.learning.content.review"].create({
-                **native_review_values, "slide_id": slide.id,
-            })
-            review.action_approve()
-        # Native Learning guards revalidate the immutable review hash here.
-        slide.write({"is_published": True, "website_published": True})
-        if not slide.exists() or slide.channel_id != channel or not slide.is_published:
-            raise UserError("Canonical content was not persisted in the target course.")
+        with self.env.cr.savepoint():
+            # This receipt is owned by v2. Suppress the legacy learning video
+            # export hook for this creation only; this context grants no access.
+            slide = self.env["slide.slide"].with_context(
+                facodi_supabase_video_sync=True,
+            ).create(slide_values)
+            if native_review_values is not None:
+                review = self.env["facodi.learning.content.review"].create({
+                    **native_review_values, "slide_id": slide.id,
+                })
+                review.action_approve()
+            # Native Learning guards revalidate the immutable review hash here.
+            slide.write({"is_published": True, "website_published": True})
+            if not slide.exists() or slide.channel_id != channel or not slide.is_published:
+                raise UserError("Canonical content was not persisted in the target course.")
 
-        self._set_execution_values({
-            "status": "published",
-            "published_slide_id": slide.id,
-            "reviewed_by_id": self.env.user.id,
-            "reviewed_at": fields.Datetime.now(),
-        })
-        if self.task_id:
-            self.task_id.message_post(body="Content reviewed and published to the authorized course.")
-        return True
+            self._set_execution_values({
+                "status": "published",
+                "published_slide_id": slide.id,
+                "reviewed_by_id": self.env.user.id,
+                "reviewed_at": fields.Datetime.now(),
+            })
+            if self.task_id:
+                self.task_id.message_post(body="Content reviewed and published to the authorized course.")
+            return True
 
     def _check_pipeline_enabled(self):
         enabled = self.env["ir.config_parameter"].sudo().get_param("facodi_api.pipeline_enabled", "false")
