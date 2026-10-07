@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -9,7 +10,7 @@ import uuid
 from html import escape
 
 from odoo import api, fields, models
-from odoo.exceptions import UserError
+from odoo.exceptions import AccessError, UserError, ValidationError
 
 from ..core.contracts.dtos import (
     CatalogSnapshot,
@@ -38,6 +39,10 @@ class FacodiPipelineRun(models.Model):
     owner_id = fields.Many2one("res.users", required=True, readonly=True, index=True, default=lambda self: self.env.user)
     company_id = fields.Many2one("res.company", required=True, readonly=True, index=True, default=lambda self: self.env.company)
     request_hash = fields.Char(readonly=True)
+    website_id = fields.Many2one("website", readonly=True, index=True, ondelete="restrict")
+    legacy_status = fields.Char(readonly=True)
+    legacy_quarantined = fields.Boolean(readonly=True, default=False, index=True)
+    is_manual_transcript = fields.Boolean(default=False, help="Explicit caller-supplied transcript; no provider acquisition is claimed.")
     source_type = fields.Selection(
         [
             ("youtube", "YouTube Video"),
@@ -91,14 +96,120 @@ class FacodiPipelineRun(models.Model):
         "Idempotency key must be unique per owner and company.",
     )
 
+    _run_uuid_uniq = models.Constraint("UNIQUE(run_id)", "Run UUID must be unique.")
+
+    _submission_fields = frozenset({
+        "name", "source_type", "source_url", "title", "raw_content", "language",
+        "idempotency_key", "target_channel_id", "is_manual_transcript",
+    })
+    _reserved_fields = frozenset({
+        "run_id", "owner_id", "company_id", "website_id", "request_hash", "status",
+        "source_type", "source_url", "title", "raw_content", "language",
+        "idempotency_key", "target_channel_id", "is_manual_transcript",
+        "legacy_quarantined", "legacy_status", "project_id", "task_id", "published_slide_id",
+        "reviewed_by_id", "reviewed_at", "error_message", "artifacts_json",
+        "metadata_json", "execution_time", "concepts_count", "chunks_count",
+    })
+
+    @api.model
+    def _normalize_submission(self, values):
+        if set(values) - self._submission_fields:
+            raise AccessError("Generated identity, state and provenance cannot be supplied.")
+        vals = dict(values)
+        vals.setdefault("source_type", "document")
+        vals.setdefault("language", "pt")
+        for field, limit in (("source_type", 20), ("source_url", 2048), ("title", 256),
+                             ("language", 20), ("raw_content", 262144), ("name", 256)):
+            value = vals.get(field) or ""
+            if not isinstance(value, str) or len(value.encode("utf-8")) > limit:
+                raise ValidationError("Invalid or oversized source field: %s" % field)
+            vals[field] = value
+        if vals["source_type"] not in {"youtube", "manual", "markdown", "document"}:
+            raise ValidationError("Unsupported source type.")
+        key = vals.get("idempotency_key")
+        if not isinstance(key, str) or not 1 <= len(key) <= 128:
+            raise ValidationError("Idempotency key is required (1–128 characters).")
+        manual = vals.get("is_manual_transcript", False)
+        if not isinstance(manual, bool):
+            raise ValidationError("is_manual_transcript must be boolean.")
+        vals["is_manual_transcript"] = manual
+        if vals["source_type"] == "youtube":
+            from ..core.ingestion.youtube import YouTubeIngestionAdapter
+            if not YouTubeIngestionAdapter.extract_video_id(vals["source_url"]):
+                raise ValidationError("Invalid HTTPS YouTube URL.")
+            if vals["raw_content"] and not manual:
+                raise ValidationError("A supplied transcript must be marked explicitly.")
+        if (vals["source_type"] != "youtube" or manual) and not vals["raw_content"].strip():
+            raise ValidationError("Nonempty source content is required.")
+        channel_id = vals.get("target_channel_id")
+        if isinstance(channel_id, bool) or not isinstance(channel_id, int) or channel_id <= 0:
+            raise ValidationError("An authorized publication course is required.")
+        return vals
+
+    @api.model
+    def _submission_fingerprint(self, vals):
+        payload = {key: vals[key] for key in sorted(self._submission_fields - {"name"})}
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+    @api.model
+    def _authorize_channel(self, channel, company, website=None, *, publication=False):
+        if not channel.exists():
+            raise ValidationError("Course not found.")
+        channel.check_access("read")
+        if not channel.active or not channel.website_id or channel.website_id.company_id != company:
+            raise AccessError("The course must belong to a website in the run company.")
+        if website and channel.website_id != website:
+            raise AccessError("The course website changed after intake.")
+        if publication or self.env.user.has_group("facodi_api.group_pipeline_reviewer"):
+            channel.check_access("write")
+        elif channel.user_id != self.env.user:
+            raise AccessError("Operators may submit only to courses they own.")
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        self._check_pipeline_enabled()
+        self.check_access("create")
+        prepared = []
+        for values in vals_list:
+            vals = self._normalize_submission(values)
+            channel = self.env["slide.channel"].browse(vals["target_channel_id"])
+            self._authorize_channel(channel, self.env.company)
+            vals.update({
+                "run_id": str(uuid.uuid4()), "owner_id": self.env.user.id,
+                "company_id": self.env.company.id, "website_id": channel.website_id.id,
+                "request_hash": self._submission_fingerprint(vals), "status": "received",
+                "name": vals["name"] or vals["title"] or "Content intake",
+            })
+            prepared.append(vals)
+        runs = super().create(prepared)
+        for run in runs:
+            run._ensure_project_task()
+        return runs
+
+    def write(self, vals):
+        if self._reserved_fields.intersection(vals):
+            raise AccessError("Accepted input and generated workflow fields are immutable through RPC.")
+        return super().write(vals)
+
+    def _set_execution_values(self, vals):
+        """Private capability: never authorize trusted writes with caller context."""
+        return super().write(vals)
+
     def action_execute_pipeline(self):
         """Execute the pure Python pipeline runner and update record state."""
         self.ensure_one()
         self._check_pipeline_enabled()
-        if self.status in ["running", "published"]:
-            return
-
-        self.write({"status": "running", "error_message": False})
+        self.check_access("write")
+        self.env.cr.execute("SELECT id FROM facodi_pipeline_run WHERE id = %s FOR UPDATE SKIP LOCKED", [self.id])
+        if not self.env.cr.fetchone():
+            return False
+        self.invalidate_recordset()
+        if self.legacy_quarantined or self.status != "received":
+            raise UserError("Only newly received, non-quarantined runs can execute.")
+        if self.env.company != self.company_id:
+            raise AccessError("Execution must use the recorded company.")
+        self._authorize_channel(self.target_channel_id, self.company_id, self.website_id)
+        self._set_execution_values({"status": "running", "error_message": False})
 
         # Build ContentSource
         source = ContentSource(
@@ -107,6 +218,7 @@ class FacodiPipelineRun(models.Model):
             title=self.title,
             raw_content=self.raw_content,
             language=self.language or "pt",
+            metadata={"is_manual_transcript": self.is_manual_transcript},
         )
 
         # Build CatalogSnapshot from Odoo courses / subjects if available
@@ -114,7 +226,7 @@ class FacodiPipelineRun(models.Model):
         try:
             # Check if slide.channel exists (Odoo eLearning)
             if "slide.channel" in self.env:
-                channels = self.env["slide.channel"].search([("active", "=", True)], limit=50)
+                channels = self.env["slide.channel"].search([("active", "=", True), ("website_id", "=", self.website_id.id), ("website_id.company_id", "=", self.company_id.id)], limit=50)
                 for c in channels:
                     targets.append(
                         TargetEntity(
@@ -148,15 +260,14 @@ class FacodiPipelineRun(models.Model):
                 "concepts_count": res_run.metadata.get("concepts_count", 0),
                 "chunks_count": res_run.metadata.get("chunks_count", 0),
             }
-            self.write(vals)
+            self._set_execution_values(vals)
             self._sync_to_project_task()
             return True
-        except Exception as e:
-            _logger.exception("Pipeline execution failed for run %s", self.id)
-            self.write({
-                "status": "failed",
-                "error_message": "Pipeline execution failed",
-            })
+        except Exception as exc:
+            from ..core.ingestion.youtube import YouTubeAcquisitionError
+            code = exc.code if isinstance(exc, YouTubeAcquisitionError) else "PIPELINE_FAILED"
+            _logger.error("Pipeline execution failed run=%s code=%s", self.run_id, code, exc_info=False)
+            self._set_execution_values({"status": "failed", "error_message": code})
             if self.task_id:
                 self.task_id.message_post(body="Falha na execução do pipeline.")
             return False
@@ -221,7 +332,7 @@ class FacodiPipelineRun(models.Model):
                 "user_ids": [(4, owner.id)],
                 "sequence": seq,
             })
-        self.write({"project_id": project.id, "task_id": task.id})
+        self._set_execution_values({"project_id": project.id, "task_id": task.id})
 
     def action_approve_and_publish(self):
         """Atomically publish reviewed content as a canonical eLearning slide."""
@@ -230,6 +341,7 @@ class FacodiPipelineRun(models.Model):
         if not self.env.user.has_group("facodi_api.group_pipeline_reviewer"):
             raise UserError("Only an eLearning manager can approve publication.")
 
+        self.check_access("write")
         self.env.cr.execute(
             "SELECT id FROM facodi_pipeline_run WHERE id = %s FOR UPDATE",
             [self.id],
@@ -239,22 +351,22 @@ class FacodiPipelineRun(models.Model):
             if self.published_slide_id.channel_id != self.target_channel_id:
                 raise UserError("Published content does not match the authorized course.")
             return True
-        if self.status != "waiting_review":
+        if self.legacy_quarantined or self.status != "waiting_review":
             raise UserError("Only runs waiting for review can be published.")
         if not self.target_channel_id:
             raise UserError("The run has no authorized publication course.")
 
         channel = self.target_channel_id
-        channel.check_access("write")
-        if not channel.active:
-            raise UserError("The target course is archived.")
+        self._authorize_channel(channel, self.company_id, self.website_id, publication=True)
 
         metadata = json.loads(self.metadata_json or "{}")
         enriched = metadata.get("enriched_data") or {}
         summary = enriched.get("summary") or self.raw_content or ""
+        if not isinstance(summary, str) or not summary.strip():
+            raise UserError("Empty content cannot be published.")
         paragraphs = [part.strip() for part in summary.splitlines() if part.strip()]
         html_content = "".join(f"<p>{escape(paragraph)}</p>" for paragraph in paragraphs)
-        slide = self.env["slide.slide"].create({
+        slide_values = {
             "name": self.title or self.name,
             "channel_id": channel.id,
             "slide_category": "article",
@@ -264,11 +376,14 @@ class FacodiPipelineRun(models.Model):
             "website_published": True,
             "is_preview": False,
             "user_id": self.env.user.id,
-        })
+        }
+        if self.source_type == "youtube":
+            slide_values.update({"slide_category": "video", "source_type": "external", "video_url": self.source_url})
+        slide = self.env["slide.slide"].create(slide_values)
         if not slide.exists() or slide.channel_id != channel or not slide.is_published:
             raise UserError("Canonical content was not persisted in the target course.")
 
-        self.write({
+        self._set_execution_values({
             "status": "published",
             "published_slide_id": slide.id,
             "reviewed_by_id": self.env.user.id,
@@ -288,22 +403,27 @@ class FacodiPipelineRun(models.Model):
     @api.model
     def cron_process_received_runs(self):
         """Cron job to process newly received background pipeline requests with exclusive row lock."""
+        if not self.env.is_superuser() and not self.env.user.has_group("base.group_system"):
+            raise AccessError("Only the scheduler administrator can process the queue.")
         enabled = self.env["ir.config_parameter"].sudo().get_param("facodi_api.pipeline_enabled", "false")
         if enabled.lower() not in ("true", "1"):
-            return
+            return False
         self.env.cr.execute(
             """SELECT id FROM facodi_pipeline_run
                WHERE status = 'received'
                ORDER BY id
-               LIMIT 10
+               LIMIT 1
                FOR UPDATE SKIP LOCKED"""
         )
         row_ids = [row[0] for row in self.env.cr.fetchall()]
         if not row_ids:
-            return
+            return False
         runs = self.browse(row_ids)
         for run in runs:
             try:
-                run.with_user(run.owner_id).action_execute_pipeline()
+                with self.env.cr.savepoint():
+                    run.with_user(run.owner_id).with_context(allowed_company_ids=[run.company_id.id]).with_company(run.company_id).action_execute_pipeline()
             except Exception:
                 _logger.error("Error processing run %s in cron", run.id, exc_info=False)
+
+        return True

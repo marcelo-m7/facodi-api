@@ -42,6 +42,8 @@ class DocumentIngestionAdapter:
 
         # Check raw text or markdown direct input
         if source.source_type == SourceType.MARKDOWN or source.source_type == SourceType.MANUAL:
+            if not isinstance(source.raw_content, str) or not source.raw_content.strip():
+                raise ValueError("Document source has no content")
             text_content = source.raw_content or ""
             markdown_content = source.raw_content or ""
             if not source.title:

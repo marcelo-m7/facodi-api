@@ -81,7 +81,7 @@ def test_current_transcript_api_attribute_snippets(monkeypatch):
         fetch=lambda: [types.SimpleNamespace(start=2.5, duration=1.25, text="Real evidence")])
     api = types.SimpleNamespace(list=lambda video_id: types.SimpleNamespace(find_transcript=lambda langs: transcript))
     module = types.ModuleType("youtube_transcript_api")
-    module.YouTubeTranscriptApi = lambda: api
+    module.YouTubeTranscriptApi = lambda **kwargs: api
     errors = types.ModuleType("youtube_transcript_api._errors")
     for name in ("NoTranscriptFound", "TranscriptsDisabled", "VideoUnavailable"):
         setattr(errors, name, type(name, (Exception,), {}))

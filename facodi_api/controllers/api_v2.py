@@ -4,17 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
-import hashlib
-import io
-import os
-import uuid
 
 from odoo import http
 from odoo.http import request
 from werkzeug.exceptions import BadRequest, Forbidden, NotFound, ServiceUnavailable, RequestEntityTooLarge, Unauthorized, UnsupportedMediaType
 from werkzeug.wrappers import Response
 
-from ..core.contracts.http_input import read_json_object, PayloadTooLarge, InvalidPayload
+from ..core.contracts.http_input import read_request_object, PayloadTooLarge, InvalidPayload
 
 _logger = logging.getLogger(__name__)
 
@@ -41,23 +37,12 @@ class FacodiApiV2Controller(http.Controller):
         self._check_auth()
         if not request.httprequest.is_json:
             raise UnsupportedMediaType("Content-Type must be application/json")
-        if request.httprequest.content_length and request.httprequest.content_length > 262144:
-            raise RequestEntityTooLarge("Payload too large")
-        max_bytes = 262144
-        content_length = request.httprequest.content_length
-        if content_length is not None and content_length > max_bytes:
-            raise RequestEntityTooLarge("Payload too large")
-        wsgi_input = request.httprequest.environ.get("wsgi.input")
-        if wsgi_input is not None:
-            chunk = wsgi_input.read(max_bytes + 1)
-            if len(chunk) > max_bytes:
-                raise RequestEntityTooLarge("Payload too large")
-            body = chunk
-        else:
-            request.httprequest.max_content_length = max_bytes
-            body = request.httprequest.get_data(cache=False)
         try:
-            data = read_json_object(io.BytesIO(body))
+            request.httprequest.max_content_length = 262145
+            data = read_request_object(
+                request.httprequest.stream, request.httprequest.content_length,
+                terminated=bool(request.httprequest.environ.get("wsgi.input_terminated")),
+            )
         except PayloadTooLarge:
             raise RequestEntityTooLarge("Payload too large") from None
         except InvalidPayload:
@@ -71,26 +56,25 @@ class FacodiApiV2Controller(http.Controller):
 
         if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 128:
             raise BadRequest("Idempotency-Key is required (1–128 characters)")
-        fingerprint = hashlib.sha256(json.dumps(data, sort_keys=True, allow_nan=False).encode()).hexdigest()
-
-        source_type = data.get("source_type", "document")
-        url = data.get("url")
-        title = data.get("title")
-        raw_content = data.get("raw_content")
-        language = data.get("language", "pt")
-        channel_id = data.get("channel_id")
-        if isinstance(channel_id, bool) or not isinstance(channel_id, int) or channel_id <= 0:
-            raise BadRequest("channel_id must identify an authorized course")
-        channel = request.env["slide.channel"].browse(channel_id).exists()
-        if not channel:
-            raise NotFound("Course not found.")
-        channel.check_access("read")
-        if request.env.user.has_group("facodi_api.group_pipeline_reviewer"):
-            channel.check_access("write")
-        elif channel.user_id != request.env.user:
-            raise Forbidden("Operators may submit only to courses they own.")
-
+        from odoo.exceptions import AccessError, ValidationError
         RunModel = request.env["facodi.pipeline.run"]
+        allowed = {"source_type", "url", "title", "raw_content", "language", "channel_id",
+                   "idempotency_key", "is_manual_transcript", "sync"}
+        if set(data) - allowed:
+            raise BadRequest("Unsupported submission fields")
+        if data.get("sync") not in (None, False):
+            raise BadRequest("Synchronous execution is disabled")
+        values = {key: data[key] for key in ("source_type", "title", "raw_content", "language", "is_manual_transcript") if key in data}
+        values.update({"source_url": data.get("url"), "target_channel_id": data.get("channel_id"), "idempotency_key": idempotency_key})
+        try:
+            values = RunModel._normalize_submission(values)
+            channel = request.env["slide.channel"].browse(values["target_channel_id"])
+            RunModel._authorize_channel(channel, request.env.company)
+        except ValidationError:
+            raise BadRequest("Invalid content submission") from None
+        except AccessError:
+            raise Forbidden("Course is outside the authorized scope") from None
+        fingerprint = RunModel._submission_fingerprint(values)
         scope = [
             ("idempotency_key", "=", idempotency_key),
             ("owner_id", "=", request.env.user.id),
@@ -98,8 +82,13 @@ class FacodiApiV2Controller(http.Controller):
         ]
         lock_key = f"facodi-pipeline:{request.env.company.id}:{request.env.user.id}:{idempotency_key}"
         lock_cursor = request.env.registry.cursor()
-        lock_cursor.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))", [lock_key])
-        lock_cursor.commit()
+        try:
+            lock_cursor.execute("SET lock_timeout = '10s'")
+            lock_cursor.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))", [lock_key])
+            lock_cursor.commit()
+        except Exception:
+            lock_cursor.close()
+            raise ServiceUnavailable("Submission busy; retry with the same idempotency key.") from None
 
         def release_idempotency_lock():
             if lock_cursor.closed:
@@ -131,20 +120,7 @@ class FacodiApiV2Controller(http.Controller):
             }
             return Response(json.dumps(resp), status=200, mimetype="application/json")
 
-        run_record = RunModel.create({
-            "name": title or f"Run {idempotency_key}",
-            "run_id": str(uuid.uuid4()),
-            "idempotency_key": idempotency_key,
-            "request_hash": fingerprint,
-            "source_type": source_type,
-            "source_url": url,
-            "title": title,
-            "raw_content": raw_content,
-            "language": language,
-            "target_channel_id": channel.id,
-            "status": "received",
-        })
-        run_record._ensure_project_task()
+        run_record = RunModel.create(values)
 
         resp = {
             "run_id": run_record.run_id,

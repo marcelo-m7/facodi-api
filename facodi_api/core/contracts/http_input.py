@@ -1,5 +1,6 @@
 """Bounded, strict JSON parsing shared by the HTTP adapter and standalone tests."""
 import json
+import io
 
 class PayloadTooLarge(ValueError):
     pass
@@ -24,3 +25,20 @@ def read_json_object(stream, limit=262144):
     if not isinstance(value, dict):
         raise InvalidPayload('Invalid JSON: expected an object')
     return value
+
+
+def read_request_object(stream, content_length, *, terminated=False, limit=262144):
+    """Respect Content-Length; only read to EOF on a server-terminated stream."""
+    if content_length is not None:
+        if content_length < 0:
+            raise InvalidPayload('Invalid Content-Length')
+        if content_length > limit:
+            raise PayloadTooLarge('Payload too large')
+        raw = stream.read(content_length)
+        if len(raw) != content_length:
+            raise InvalidPayload('Incomplete body')
+    elif terminated:
+        raw = stream.read(limit + 1)
+    else:
+        raise InvalidPayload('Content-Length or terminated stream is required')
+    return read_json_object(io.BytesIO(raw), limit=limit)
