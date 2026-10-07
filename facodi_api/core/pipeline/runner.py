@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 from ..contracts.dtos import (
     CatalogSnapshot,
     ContentDocument,
+    ContentChunk,
     ContentSource,
     EnrichedDocument,
     MappingResult,
@@ -88,7 +89,10 @@ class PipelineRunner:
         """Execute all steps idempotently."""
         run_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "facodi-api-v2:" + idempotency_key)) if idempotency_key else str(uuid.uuid4())
         stable_catalog = {k: v for k, v in catalog.to_dict().items() if k != "created_at"} if catalog else None
-        fingerprint = hashlib.sha256(json.dumps({"source": source.compute_hash(), "catalog": stable_catalog, "provider": type(self.enrichment_provider).__module__ + "." + type(self.enrichment_provider).__name__, "pipeline_version": "2.0.1"}, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        identity = getattr(self.enrichment_provider, 'cache_identity', None)
+        provider_identity = (identity() if identity else {
+            'implementation': type(self.enrichment_provider).__module__ + '.' + type(self.enrichment_provider).__name__})
+        fingerprint = hashlib.sha256(json.dumps({"source": source.compute_hash(), "catalog": stable_catalog, "provider": provider_identity, "pipeline_version": "2.1.0"}, sort_keys=True, allow_nan=False).encode()).hexdigest()
         
         # Check if already completed under this idempotency_key
         existing = self.load_run(run_id)
@@ -101,6 +105,8 @@ class PipelineRunner:
         if existing and existing.status == RunStatus.SUCCEEDED:
             logger.info("Run %s already completed (idempotency hit)", run_id)
             return existing
+
+        checkpoints = dict(existing.metadata) if existing else {}
 
         now = utc_now_iso()
         steps = [
@@ -118,14 +124,15 @@ class PipelineRunner:
             created_at=now,
             updated_at=now,
             steps=steps,
-            metadata={"input_fingerprint": fingerprint},
+            metadata={"input_fingerprint": fingerprint, "provider_identity": provider_identity},
         )
         self.save_run(run)
 
         try:
             # 1. Ingestion
             t0 = time.time()
-            content_doc = self.ingestion_service.ingest(source)
+            content_doc = (ContentDocument.from_dict(checkpoints['document_data'])
+                           if checkpoints.get('document_data') else self.ingestion_service.ingest(source))
             dur = round(time.time() - t0, 3)
             steps[0] = PipelineStep(
                 step_key="ingest",
@@ -146,13 +153,14 @@ class PipelineRunner:
                 updated_at=utc_now_iso(),
                 steps=list(steps),
                 artifacts={**run.artifacts, "document": content_doc.id},
-                metadata={**run.metadata, "document_title": content_doc.title},
+                metadata={**run.metadata, "document_title": content_doc.title, "document_data": content_doc.to_dict()},
             )
             self.save_run(run)
 
             # 2. Normalization & Chunking
             t0 = time.time()
-            chunks = self.normalizer.chunk_document(content_doc)
+            chunks = ([ContentChunk.from_dict(item) for item in checkpoints['chunks_data']]
+                      if checkpoints.get('chunks_data') else self.normalizer.chunk_document(content_doc))
             dur = round(time.time() - t0, 3)
             steps[1] = PipelineStep(
                 step_key="normalize",
@@ -172,13 +180,14 @@ class PipelineRunner:
                 updated_at=utc_now_iso(),
                 steps=list(steps),
                 artifacts=run.artifacts,
-                metadata={**run.metadata, "chunks_count": len(chunks)},
+                metadata={**run.metadata, "chunks_count": len(chunks), "chunks_data": [chunk.to_dict() for chunk in chunks]},
             )
             self.save_run(run)
 
             # 3. Enrichment
             t0 = time.time()
-            enriched_doc = self.enrichment_provider.enrich(content_doc, chunks)
+            enriched_doc = (EnrichedDocument.from_dict(checkpoints['enriched_data'])
+                            if checkpoints.get('enriched_data') else self.enrichment_provider.enrich(content_doc, chunks))
             dur = round(time.time() - t0, 3)
             steps[2] = PipelineStep(
                 step_key="enrich",
@@ -203,6 +212,7 @@ class PipelineRunner:
                     **run.metadata,
                     "concepts_count": len(enriched_doc.concepts),
                     "topics_count": len(enriched_doc.topics),
+                    "enriched_data": enriched_doc.to_dict(),
                 },
             )
             self.save_run(run)

@@ -61,12 +61,12 @@ class FacodiApiV2Controller(http.Controller):
         from odoo.exceptions import AccessError, ValidationError
         RunModel = request.env["facodi.pipeline.run"]
         allowed = {"source_type", "url", "title", "raw_content", "language", "channel_id",
-                   "idempotency_key", "is_manual_transcript", "sync"}
+                   "idempotency_key", "is_manual_transcript", "sync", "attachment_id", "existing_slide_id"}
         if set(data) - allowed:
             raise BadRequest("Unsupported submission fields")
         if data.get("sync") not in (None, False):
             raise BadRequest("Synchronous execution is disabled")
-        values = {key: data[key] for key in ("source_type", "title", "raw_content", "language", "is_manual_transcript") if key in data}
+        values = {key: data[key] for key in ("source_type", "title", "raw_content", "language", "is_manual_transcript", "attachment_id", "existing_slide_id") if key in data}
         values.update({"source_url": data.get("url"), "target_channel_id": data.get("channel_id"), "idempotency_key": idempotency_key})
         from ..models.pipeline_run import SubmissionBusy, SubmissionConflict
         try:

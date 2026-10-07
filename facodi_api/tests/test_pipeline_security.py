@@ -184,3 +184,44 @@ class TestPipelineSecurity(TransactionCase):
         self.assertTrue(run.action_execute_pipeline())
         self.assertEqual(run.attempt_count, 1)
         self.assertEqual(run.status, 'waiting_review')
+
+    def test_authorized_attachment_is_snapshotted_and_converted(self):
+        import base64
+        attachment = self.env['ir.attachment'].with_user(self.operator).create({
+            'name': 'original.txt', 'datas': base64.b64encode(b'Original attachment learning evidence.'),
+        })
+        run = self.Run.create(dict(self.values('attachment'), source_type='document', raw_content='', attachment_id=attachment.id))
+        self.assertTrue(run.attachment_digest)
+        self.assertTrue(run.action_execute_pipeline())
+        self.assertEqual(run.status, 'waiting_review')
+        self.assertEqual(run.chunks_count, 1)
+
+    def test_attachment_change_is_detected_before_processing(self):
+        import base64
+        attachment = self.env['ir.attachment'].with_user(self.operator).create({
+            'name': 'original.txt', 'datas': base64.b64encode(b'Original evidence.'),
+        })
+        run = self.Run.create(dict(self.values('changed-attachment'), source_type='document', raw_content='', attachment_id=attachment.id))
+        attachment.write({'datas': base64.b64encode(b'Replaced evidence.')})
+        self.assertFalse(run.action_execute_pipeline())
+        self.assertEqual(run.status, 'waiting_input')
+        self.assertEqual(run.error_message, 'ATTACHMENT_CHANGED')
+        self.assertFalse(run.metadata_json)
+
+    def test_foreign_unlinked_attachment_cannot_be_submitted(self):
+        import base64
+        attachment = self.env['ir.attachment'].create({'name': 'private.txt', 'datas': base64.b64encode(b'Private.')})
+        with self.assertRaises(AccessError):
+            self.Run.create(dict(self.values('foreign-attachment'), source_type='document', raw_content='', attachment_id=attachment.id))
+
+    def test_existing_source_change_invalidates_processing_snapshot(self):
+        self.operator.write({'group_ids': [Command.link(self.env.ref('website_slides.group_website_slides_officer').id)]})
+        slide = self.env['slide.slide'].with_user(self.operator).create({
+            'name': 'Existing original', 'channel_id': self.channel.id,
+            'slide_category': 'article', 'html_content': '<p>Original evidence.</p>',
+        })
+        run = self.Run.create(dict(self.values('existing-snapshot'), existing_slide_id=slide.id))
+        slide.write({'html_content': '<p>Changed evidence.</p>'})
+        self.assertFalse(run.action_execute_pipeline())
+        self.assertEqual(run.error_message, 'CANONICAL_INPUT_CHANGED')
+        self.assertEqual(run.status, 'waiting_input')

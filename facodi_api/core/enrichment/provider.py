@@ -22,6 +22,9 @@ from ..contracts.dtos import (
 class BaseEnrichmentProvider(abc.ABC):
     """Abstract provider for concept extraction, summary and key takeaway generation."""
 
+    def cache_identity(self):
+        return {'implementation': type(self).__module__ + '.' + type(self).__name__}
+
     @abc.abstractmethod
     def enrich(
         self, document: ContentDocument, chunks: List[ContentChunk]
@@ -32,6 +35,9 @@ class BaseEnrichmentProvider(abc.ABC):
 
 class BaselineDeterministicProvider(BaseEnrichmentProvider):
     """Deterministic, offline enrichment provider requiring no external LLM API."""
+
+    def cache_identity(self):
+        return {**super().cache_identity(), 'version': 'regex-frequency-v2-evidence'}
 
     STOP_WORDS = {
         "a", "o", "os", "as", "um", "uma", "uns", "umas", "de", "do", "da", "dos", "das",
@@ -60,12 +66,19 @@ class BaselineDeterministicProvider(BaseEnrichmentProvider):
         top_concepts: List[ConceptExtraction] = []
         for name, count in sorted_words[:12]:
             score = round(min(count / 10.0, 1.0), 2)
+            references = [chunk for chunk in chunks if re.search(r'\b' + re.escape(name) + r'\b', chunk.text, re.I)]
+            if not references:
+                continue
+            evidence_chunk = references[0]
+            match = re.search(r'\b' + re.escape(name) + r'\b', evidence_chunk.text, re.I)
+            snippet = evidence_chunk.text[max(0, match.start() - 80):match.end() + 80]
             top_concepts.append(
                 ConceptExtraction(
                     name=name.capitalize(),
                     relevance=score,
                     category="Keyword",
-                    evidence_snippet=f"Ocorrência de {count} vezes no conteúdo.",
+                    evidence_snippet=snippet,
+                    chunk_indices=[chunk.index for chunk in references],
                 )
             )
 
@@ -102,9 +115,10 @@ class BaselineDeterministicProvider(BaseEnrichmentProvider):
             concepts=top_concepts,
             keywords=keywords,
             suggested_category=cat,
-            target_audience_level="intermediate",
+            target_audience_level="unspecified",
             prerequisites=[],
             provider_name="baseline-deterministic",
-            model_name="regex-frequency-v1",
+            model_name="regex-frequency-v2-evidence",
+            warnings=['Deterministic lexical baseline; no LLM analysis or academic equivalence is inferred.'],
             created_at=utc_now_iso(),
         )

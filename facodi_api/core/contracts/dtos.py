@@ -212,6 +212,7 @@ class ConceptExtraction:
     evidence_snippet: Optional[str] = None
     start_time: Optional[float] = None
     end_time: Optional[float] = None
+    chunk_indices: List[int] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -235,6 +236,13 @@ class EnrichedDocument:
     warnings: List[str] = field(default_factory=list)
     schema_version: str = "2.0.0"
     created_at: str = field(default_factory=utc_now_iso)
+
+    @classmethod
+    def from_dict(cls, data):
+        values = dict(data)
+        values['concepts'] = [ConceptExtraction(**item) for item in values.get('concepts', [])]
+        values['suggested_category'] = ContentCategory(values['suggested_category'])
+        return cls(**values)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
