@@ -225,3 +225,39 @@ class TestPipelineSecurity(TransactionCase):
         self.assertFalse(run.action_execute_pipeline())
         self.assertEqual(run.error_message, 'CANONICAL_INPUT_CHANGED')
         self.assertEqual(run.status, 'waiting_input')
+
+    def test_document_failure_preserves_safe_acquisition_code(self):
+        import base64
+        attachment = self.env['ir.attachment'].with_user(self.operator).create({
+            'name': 'invalid.pdf', 'datas': base64.b64encode(b'This is not a PDF.'),
+        })
+        run = self.Run.create(dict(self.values('invalid-pdf'), source_type='document', raw_content='', attachment_id=attachment.id))
+        self.assertFalse(run.action_execute_pipeline())
+        self.assertEqual(run.error_message, 'DOCUMENT_INVALID_FORMAT')
+        self.assertFalse(run.metadata_json)
+
+    def test_enrichment_configuration_is_server_owned_and_frozen(self):
+        import json
+        params = self.env['ir.config_parameter'].sudo()
+        params.set_param('facodi_api.enrichment_provider', 'baseline')
+        run = self.Run.with_context(default_provider_config_json='{"provider":"gemini"}').create(self.values('provider-freeze'))
+        self.assertEqual(json.loads(run.provider_config_json)['provider'], 'baseline')
+        params.set_param('facodi_api.enrichment_provider', 'unsupported-provider')
+        self.assertTrue(run.action_execute_pipeline())
+        self.assertEqual(json.loads(run.metadata_json)['enriched_data']['provider_name'], 'baseline-deterministic')
+        with self.assertRaises(AccessError):
+            run.write({'provider_config_json': '{}'})
+
+    def test_catalog_snapshot_has_no_silent_fifty_course_limit(self):
+        import json
+        courses = self.env['slide.channel'].create([{
+            'name': 'Authorized snapshot course %s' % index,
+            'user_id': self.operator.id, 'website_id': self.channel.website_id.id,
+        } for index in range(51)])
+        run = self.Run.create(self.values('catalog-full'))
+        snapshot = json.loads(run.catalog_snapshot_json)
+        self.assertTrue({'channel_%s' % course.id for course in courses}.issubset({target['id'] for target in snapshot['targets']}))
+        accepted = run.catalog_snapshot_json
+        courses[0].name = 'Renamed after acceptance'
+        self.assertTrue(run.action_execute_pipeline())
+        self.assertEqual(run.catalog_snapshot_json, accepted)
