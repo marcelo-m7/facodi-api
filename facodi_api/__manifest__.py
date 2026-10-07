@@ -4,8 +4,9 @@
     "version": "19.0.1.0.0",
     "category": "Productivity",
     "author": "FACODI",
-    "depends": ["base", "web", "mail", "project"],
+    "depends": ["base", "web", "mail", "project", "website_slides"],
     "data": [
+        "security/pipeline_security.xml",
         "security/ir.model.access.csv",
         "data/ir_cron_data.xml",
     ],
