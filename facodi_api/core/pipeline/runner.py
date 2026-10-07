@@ -124,7 +124,7 @@ class PipelineRunner:
             created_at=now,
             updated_at=now,
             steps=steps,
-            metadata={"input_fingerprint": fingerprint, "provider_identity": provider_identity},
+            metadata={**checkpoints, "input_fingerprint": fingerprint, "provider_identity": provider_identity},
         )
         self.save_run(run)
 

@@ -11,12 +11,10 @@ class SubmissionAdvisoryLock:
     def release(self):
         if self.released or self.cursor.closed:
             return
-        try:
-            self.cursor.execute(
-                "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
-                [self.lock_key],
-            )
-        finally:
-            self.released = True
-            if self.close_cursor:
-                self.cursor.close()
+        self.cursor.execute(
+            "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+            [self.lock_key],
+        )
+        self.released = True
+        if self.close_cursor:
+            self.cursor.close()

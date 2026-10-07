@@ -208,6 +208,17 @@ class TestPipelineSecurity(TransactionCase):
         self.assertEqual(run.error_message, 'ATTACHMENT_CHANGED')
         self.assertFalse(run.metadata_json)
 
+    def test_attachment_rename_is_detected_before_processing(self):
+        import base64
+        attachment = self.env['ir.attachment'].with_user(self.operator).create({
+            'name': 'original.txt', 'datas': base64.b64encode(b'Original evidence.'),
+        })
+        run = self.Run.create(dict(self.values('renamed-attachment'), source_type='document', raw_content='', attachment_id=attachment.id))
+        attachment.name = 'renamed.pdf'
+        self.assertFalse(run.action_execute_pipeline())
+        self.assertEqual(run.status, 'waiting_input')
+        self.assertEqual(run.error_message, 'ATTACHMENT_CHANGED')
+
     def test_foreign_unlinked_attachment_cannot_be_submitted(self):
         import base64
         attachment = self.env['ir.attachment'].create({'name': 'private.txt', 'datas': base64.b64encode(b'Private.')})
@@ -225,6 +236,34 @@ class TestPipelineSecurity(TransactionCase):
         self.assertFalse(run.action_execute_pipeline())
         self.assertEqual(run.error_message, 'CANONICAL_INPUT_CHANGED')
         self.assertEqual(run.status, 'waiting_input')
+
+    def test_existing_slide_rejects_unrelated_caller_content(self):
+        self.operator.write({'group_ids': [Command.link(self.env.ref('website_slides.group_website_slides_officer').id)]})
+        slide = self.env['slide.slide'].with_user(self.operator).create({
+            'name': 'Existing original', 'channel_id': self.channel.id,
+            'slide_category': 'article', 'html_content': '<p>Canonical evidence.</p>',
+        })
+        with self.assertRaises(ValidationError):
+            self.Run.create(dict(self.values('existing-mismatch'), existing_slide_id=slide.id,
+                                 raw_content='Unrelated caller content.'))
+
+    def test_run_scoped_attachment_can_be_published_by_reviewer(self):
+        import base64
+        reviewer = self.env['res.users'].create({
+            'name': 'Different pipeline reviewer', 'login': 'different-pipeline-reviewer',
+            'group_ids': [Command.set([
+                self.env.ref('facodi_api.group_pipeline_reviewer').id,
+                self.env.ref('website_slides.group_website_slides_manager').id,
+            ])],
+        })
+        attachment = self.env['ir.attachment'].with_user(self.operator).create({
+            'name': 'operator-source.txt', 'datas': base64.b64encode(b'Accepted operator evidence.'),
+        })
+        run = self.Run.create(dict(self.values('cross-reviewer-attachment'), source_type='document',
+                                   raw_content='', attachment_id=attachment.id))
+        self.assertTrue(run.action_execute_pipeline())
+        self.assertTrue(run.with_user(reviewer).action_approve_and_publish())
+        self.assertTrue(run.published_slide_id.is_published)
 
     def test_document_failure_preserves_safe_acquisition_code(self):
         import base64

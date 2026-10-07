@@ -32,6 +32,32 @@ def test_retry_reuses_completed_document_checkpoint(tmp_path):
     assert output.metadata['chunks_data']
 
 
+def test_retry_initial_receipt_preserves_completed_checkpoints_on_interrupt(tmp_path):
+    runner = PipelineRunner(InterruptedProvider(), str(tmp_path))
+    source = ContentSource(SourceType.MANUAL, raw_content='Durable checkpoint evidence for retry.')
+    with pytest.raises(RuntimeError):
+        runner.run_pipeline(source, idempotency_key='retry-initial-save')
+
+    original_save = runner.save_run
+    calls = 0
+
+    def interrupt_after_initial_save(run):
+        nonlocal calls
+        original_save(run)
+        calls += 1
+        if calls == 1:
+            raise RuntimeError('worker stopped after retry receipt')
+
+    runner.save_run = interrupt_after_initial_save
+    with pytest.raises(RuntimeError, match='retry receipt'):
+        runner.run_pipeline(source, idempotency_key='retry-initial-save')
+
+    import json
+    checkpoint = json.loads(next(tmp_path.glob('*.json')).read_text())
+    assert checkpoint['metadata']['document_data']
+    assert checkpoint['metadata']['chunks_data']
+
+
 class VersionedProvider(BaselineDeterministicProvider):
     version = 'first'
 

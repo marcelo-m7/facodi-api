@@ -197,6 +197,7 @@ class FacodiPipelineRun(models.Model):
             payload['attachment_digest'] = self._attachment_details(vals['attachment_id'], vals['target_channel_id'])[1]
         if vals['existing_slide_id']:
             slide = self._authorize_existing_slide(vals['existing_slide_id'], vals['target_channel_id'])
+            self._validate_existing_slide_source(slide, vals)
             payload['existing_slide_hash'] = self._canonical_source_hash(slide)
         return hashlib.sha256(json.dumps(payload, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
@@ -268,14 +269,39 @@ class FacodiPipelineRun(models.Model):
         return digest.hexdigest()
 
     @api.model
-    def _attachment_details(self, attachment_id, channel_id):
-        attachment = self.env['ir.attachment'].browse(attachment_id).exists()
+    def _validate_existing_slide_source(self, slide, vals):
+        """Bind caller input to the selected canonical slide before processing."""
+        if slide.slide_category == 'video':
+            canonical_url = slide.video_url or slide.url or ''
+            if vals['source_type'] != 'youtube' or vals['source_url'] != canonical_url:
+                raise ValidationError('The submitted video must match the selected canonical content.')
+            # Explicit manual transcripts are immutable input revisions; their
+            # text is evidence supplied for the canonical video, not a URL swap.
+            return
+        if slide.slide_category == 'document':
+            if vals['source_type'] != 'document' or not vals['attachment_id']:
+                raise ValidationError('The submitted document must match the selected canonical content.')
+            return
+        canonical_text = tools.html2plaintext(slide.html_content or slide.description or '').strip()
+        if not canonical_text:
+            canonical_text = (getattr(slide, 'facodi_transcript', '') or '').strip()
+        if vals['source_type'] not in {'manual', 'markdown'} or vals['raw_content'].strip() != canonical_text:
+            raise ValidationError('The submitted text must match the selected canonical content.')
+
+    @api.model
+    def _attachment_details(self, attachment_id, channel_id, *, accepted_run=None):
+        trusted = bool(accepted_run and accepted_run.exists()
+                       and accepted_run.attachment_id.id == attachment_id
+                       and accepted_run.target_channel_id.id == channel_id)
+        Attachment = self.env['ir.attachment'].sudo() if trusted else self.env['ir.attachment']
+        attachment = Attachment.browse(attachment_id).exists()
         if not attachment or attachment.type != 'binary':
             raise ValidationError('A binary attachment is required.')
-        attachment.check_access('read')
+        if not trusted:
+            attachment.check_access('read')
         if attachment.res_model == 'slide.slide' and attachment.res_id:
             self._authorize_existing_slide(attachment.res_id, channel_id)
-        elif attachment.res_model or attachment.res_id or attachment.create_uid != self.env.user:
+        elif attachment.res_model or attachment.res_id or (not trusted and attachment.create_uid != self.env.user):
             raise AccessError('Attachment is outside the accepted content scope.')
         if attachment.file_size > 2 * 1024 * 1024:
             raise ValidationError('Attachment exceeds two MiB.')
@@ -285,16 +311,23 @@ class FacodiPipelineRun(models.Model):
         content = attachment.raw
         if not content or len(content) > 2 * 1024 * 1024:
             raise ValidationError('Attachment is empty or oversized.')
-        return content, hashlib.sha256(content).hexdigest(), attachment.name
+        accepted_digest = hashlib.sha256(content + b'\0' + (attachment.name or '').encode()).hexdigest()
+        return content, accepted_digest, attachment.name
 
     def _prepare_content_source(self):
         if self.existing_slide_id:
             slide = self._authorize_existing_slide(self.existing_slide_id.id, self.target_channel_id.id)
             if self._canonical_source_hash(slide) != self.existing_slide_hash:
                 raise PipelineSourceError('CANONICAL_INPUT_CHANGED')
+            self._validate_existing_slide_source(slide, {
+                'source_type': self.source_type, 'source_url': self.source_url or '',
+                'raw_content': self.raw_content or '', 'attachment_id': self.attachment_id.id,
+            })
         content, filename = None, None
         if self.attachment_id:
-            content, digest, filename = self._attachment_details(self.attachment_id.id, self.target_channel_id.id)
+            content, digest, filename = self._attachment_details(
+                self.attachment_id.id, self.target_channel_id.id, accepted_run=self,
+            )
             if digest != self.attachment_digest:
                 raise PipelineSourceError('ATTACHMENT_CHANGED')
         return ContentSource(
@@ -404,6 +437,7 @@ class FacodiPipelineRun(models.Model):
                 vals['attachment_digest'] = self._attachment_details(vals['attachment_id'], channel.id)[1]
             if vals['existing_slide_id']:
                 slide = self._authorize_existing_slide(vals['existing_slide_id'], channel.id)
+                self._validate_existing_slide_source(slide, vals)
                 vals['existing_slide_hash'] = self._canonical_source_hash(slide)
             vals['provider_config_json'] = json.dumps(self._server_provider_configuration(), sort_keys=True)
             vals['catalog_snapshot_json'] = json.dumps(self._build_catalog_snapshot(channel).to_dict(), ensure_ascii=False)
@@ -766,7 +800,9 @@ class FacodiPipelineRun(models.Model):
             return self._authorize_existing_slide(self.existing_slide_id.id, self.target_channel_id.id)
         slide = self.env['slide.slide'].with_context(context, facodi_supabase_video_sync=True).create(values)
         if self.attachment_id and not (self.attachment_id.name or '').lower().endswith('.pdf'):
-            content, _digest, filename = self._attachment_details(self.attachment_id.id, self.target_channel_id.id)
+            content, _digest, filename = self._attachment_details(
+                self.attachment_id.id, self.target_channel_id.id, accepted_run=self,
+            )
             self.env['slide.slide.resource'].with_context(context).create({
                 'slide_id': slide.id, 'name': filename, 'file_name': filename,
                 'resource_type': 'file', 'data': base64.b64encode(content),
