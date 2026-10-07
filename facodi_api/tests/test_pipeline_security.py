@@ -31,6 +31,26 @@ class TestPipelineSecurity(TransactionCase):
         return {'source_type': 'manual', 'raw_content': 'A real reviewable paragraph.',
                 'idempotency_key': key, 'target_channel_id': self.channel.id}
 
+    def test_health_reports_loaded_addon_version(self):
+        import json
+        from ..controllers.api import FacodiApiController
+        with patch('odoo.addons.facodi_api.controllers.api.get_manifest',
+                   return_value={'version': '19.0.42.0.0'}):
+            response = FacodiApiController().health()
+        self.assertEqual(json.loads(response.data)['version'], '19.0.42.0.0')
+
+    def test_unconfigured_webhooks_create_no_events(self):
+        from werkzeug.exceptions import ServiceUnavailable
+        from ..controllers.api import FacodiApiController
+        Event = self.env['facodi.api.event']
+        before = Event.search_count([])
+        with patch.dict('os.environ', {'FACODI_SUPABASE_WEBHOOK_SECRET': '',
+                                       'FACODI_STRIPE_WEBHOOK_SECRET': ''}):
+            for method in ('supabase_webhook', 'stripe_webhook'):
+                with self.assertRaises(ServiceUnavailable):
+                    getattr(FacodiApiController(), method)()
+        self.assertEqual(Event.search_count([]), before)
+
     def test_creation_rejects_forged_provenance(self):
         for field, value in [('status', 'published'), ('owner_id', self.env.user.id),
                              ('metadata_json', '{}'), ('reviewed_by_id', self.operator.id)]:
