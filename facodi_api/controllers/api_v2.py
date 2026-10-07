@@ -163,7 +163,7 @@ class FacodiApiV2Controller(http.Controller):
         }
         return Response(json.dumps(resp), status=200, mimetype="application/json")
 
-    @http.route("/facodi/api/v2/pipeline/runs/<string:run_id>/approve", type="http", auth="bearer", methods=["POST"], csrf=False)
+    @http.route("/facodi/api/v2/pipeline/runs/<string:run_id>/approve", type="http", auth="bearer", methods=["POST"], csrf=False, max_content_length=262145)
     def approve_pipeline_run(self, run_id, **kwargs):
         """Manager approval to publish content and complete pedagogical workflow."""
         self._check_auth(reviewer=True)
@@ -171,7 +171,23 @@ class FacodiApiV2Controller(http.Controller):
         run = RunModel.search([("run_id", "=", run_id)], limit=1)
         if not run:
             raise NotFound("Run not found.")
-        run.action_approve_and_publish()
+        try:
+            request.httprequest.max_content_length = 262145
+            body = request.httprequest.get_data(cache=False)
+            data = read_request_object(io.BytesIO(body), len(body), terminated=True)
+        except PayloadTooLarge:
+            raise RequestEntityTooLarge("Payload too large") from None
+        except InvalidPayload:
+            raise BadRequest("Invalid JSON body") from None
+        if set(data) - {"publication_evidence"}:
+            raise BadRequest("Unsupported publication fields")
+        from odoo.exceptions import AccessError, UserError, ValidationError
+        try:
+            run.action_approve_and_publish(publication_evidence=data.get("publication_evidence"))
+        except AccessError:
+            raise Forbidden("Publication is outside the authorized scope") from None
+        except (UserError, ValidationError) as error:
+            raise BadRequest(str(error)) from None
         return Response(
             json.dumps({
                 "status": run.status,

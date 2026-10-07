@@ -336,7 +336,7 @@ class FacodiPipelineRun(models.Model):
             })
         self._set_execution_values({"project_id": project.id, "task_id": task.id})
 
-    def action_approve_and_publish(self):
+    def action_approve_and_publish(self, publication_evidence=None):
         """Atomically publish reviewed content as a canonical eLearning slide."""
         self.ensure_one()
         self._check_pipeline_enabled()
@@ -355,11 +355,33 @@ class FacodiPipelineRun(models.Model):
                     or not self.published_slide_id.is_published
                     or not self.published_slide_id.website_published):
                 raise UserError("Publication receipt requires reconciliation with the canonical course/content.")
+            if ("facodi.learning.content.review" in self.env
+                    and self.published_slide_id._facodi_requires_review()
+                    and not self.published_slide_id._facodi_has_approved_review()):
+                raise UserError("Canonical publication requires a current approved content review.")
             return True
         if self.legacy_quarantined or self.status != "waiting_review":
             raise UserError("Only runs waiting for review can be published.")
         if not self.target_channel_id:
             raise UserError("The run has no authorized publication course.")
+
+        native_review_values = None
+        if "facodi.learning.content.review" in self.env:
+            if not self.env.user.has_group("website_slides.group_website_slides_manager"):
+                raise AccessError("An eLearning Manager must decide the native publication review.")
+            evidence = publication_evidence
+            required = {"author", "rights_mode", "usage_basis", "purpose"}
+            if not isinstance(evidence, dict) or set(evidence) != required:
+                raise UserError("Provide verified author, rights_mode, usage_basis and purpose for publication.")
+            if any(not isinstance(evidence[key], str) or not evidence[key].strip()
+                   or len(evidence[key]) > 16384 for key in required):
+                raise UserError("Publication evidence must contain nonempty bounded text.")
+            if evidence["rights_mode"] not in {"original", "licensed", "external"}:
+                raise UserError("Invalid publication rights mode.")
+            native_review_values = {
+                **evidence, "origin": "manual", "responsible_id": self.env.user.id,
+                "source_url": self.source_url or False,
+            }
 
         channel = self.target_channel_id
         self._authorize_channel(channel, self.company_id, self.website_id, publication=True)
@@ -377,8 +399,8 @@ class FacodiPipelineRun(models.Model):
             "slide_category": "article",
             "source_type": "local_file",
             "html_content": html_content,
-            "is_published": True,
-            "website_published": True,
+            "is_published": False,
+            "website_published": False,
             "is_preview": False,
             "user_id": self.env.user.id,
         }
@@ -389,6 +411,13 @@ class FacodiPipelineRun(models.Model):
         slide = self.env["slide.slide"].with_context(
             facodi_supabase_video_sync=True,
         ).create(slide_values)
+        if native_review_values is not None:
+            review = self.env["facodi.learning.content.review"].create({
+                **native_review_values, "slide_id": slide.id,
+            })
+            review.action_approve()
+        # Native Learning guards revalidate the immutable review hash here.
+        slide.write({"is_published": True, "website_published": True})
         if not slide.exists() or slide.channel_id != channel or not slide.is_published:
             raise UserError("Canonical content was not persisted in the target course.")
 
