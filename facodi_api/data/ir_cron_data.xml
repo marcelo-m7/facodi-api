@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="ir_cron_facodi_pipeline_process" model="ir.cron">
+        <field name="name">FACODI: Process Received Pipeline Runs</field>
+        <field name="model_id" ref="model_facodi_pipeline_run"/>
+        <field name="state">code</field>
+        <field name="code">model.cron_process_received_runs()</field>
+        <field name="interval_number">5</field>
+        <field name="interval_type">minutes</field>
+        <field name="active" eval="True"/>
+    </record>
+</odoo>
