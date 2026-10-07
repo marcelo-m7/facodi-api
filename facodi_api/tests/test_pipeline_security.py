@@ -253,6 +253,7 @@ class TestPipelineSecurity(TransactionCase):
         courses = self.env['slide.channel'].create([{
             'name': 'Authorized snapshot course %s' % index,
             'user_id': self.operator.id, 'website_id': self.channel.website_id.id,
+            'website_published': True,
         } for index in range(51)])
         run = self.Run.create(self.values('catalog-full'))
         snapshot = json.loads(run.catalog_snapshot_json)
@@ -279,7 +280,20 @@ class TestPipelineSecurity(TransactionCase):
         CommandWizard = self.env['facodi.pipeline.command'].with_user(self.operator)
         with self.assertRaises(AccessError):
             CommandWizard.create({'run_id': run.id, 'command': 'cancel', 'expected_revision': 999})
-        wizard = CommandWizard.with_context(default_expected_revision=999).create({'run_id': run.id, 'command': 'cancel'})
+        with self.assertRaises(AccessError):
+            CommandWizard.with_context(
+                default_run_id=run.id,
+                default_command='retry',
+                default_expected_revision=999,
+            ).create({})
+        action = run.with_context(
+            default_run_id=123456,
+            default_command='retry',
+            default_expected_revision=999,
+        ).action_open_cancel()
+        wizard = CommandWizard.browse(action['res_id'])
+        self.assertEqual(wizard.run_id, run)
+        self.assertEqual(wizard.command, 'cancel')
         self.assertEqual(wizard.expected_revision, 0)
         wizard.action_apply()
         wizard.action_apply()

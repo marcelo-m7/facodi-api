@@ -24,6 +24,7 @@ from ..core.contracts.dtos import (
 from ..core.pipeline.runner import PipelineRunner
 from ..core.enrichment.provider import BaselineDeterministicProvider, GeminiStructuredProvider, EnrichmentError
 from ..core.ingestion.document import DocumentAcquisitionError
+from ..core.submission_lock import SubmissionAdvisoryLock
 from ..core.contracts.lifecycle import (
     InvalidTransition, RevisionConflict, command_transition, failure_status,
 )
@@ -323,39 +324,45 @@ class FacodiPipelineRun(models.Model):
                 raise SubmissionConflict("Idempotency key conflicts with the accepted payload.")
             return local._submission_receipt(False)
         lock_key = f"facodi-pipeline:{self.env.company.id}:{self.env.uid}:{values['idempotency_key']}"
-        lock_cursor = self.env.registry.cursor()
         try:
-            lock_cursor.execute("SET LOCAL lock_timeout = '10s'")
-            lock_cursor.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))", [lock_key])
-            lock_cursor.commit()
+            with self.env.cr.savepoint():
+                self.env.cr.execute("SET LOCAL lock_timeout = '10s'")
+                self.env.cr.execute(
+                    "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+                    [lock_key],
+                )
+                self.env.cr.execute("SET LOCAL lock_timeout = DEFAULT")
         except Exception:
-            lock_cursor.close()
             raise SubmissionBusy("Submission busy; retry with the same key.") from None
 
-        def release():
-            if lock_cursor.closed:
-                return
-            try:
-                lock_cursor.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", [lock_key])
-            finally:
-                lock_cursor.close()
+        lock = SubmissionAdvisoryLock(self.env.cr, lock_key)
 
-        self.env.cr.postcommit.add(release)
-        self.env.cr.postrollback.add(release)
-        lock_cursor.execute(
-            """SELECT id, run_id, idempotency_key, request_hash, status, create_date, revision
-               FROM facodi_pipeline_run WHERE owner_id=%s AND company_id=%s AND idempotency_key=%s LIMIT 1""",
-            [self.env.uid, self.env.company.id, values["idempotency_key"]],
-        )
-        existing = lock_cursor.fetchone()
+        self.env.cr.postcommit.add(lock.release)
+        self.env.cr.postrollback.add(lock.release)
+        try:
+            with self.env.registry.cursor() as committed_cursor:
+                committed_cursor.execute(
+                    """SELECT id, run_id, idempotency_key, request_hash, status, create_date, revision
+                       FROM facodi_pipeline_run WHERE owner_id=%s AND company_id=%s AND idempotency_key=%s LIMIT 1""",
+                    [self.env.uid, self.env.company.id, values["idempotency_key"]],
+                )
+                existing = committed_cursor.fetchone()
+        except Exception:
+            lock.release()
+            raise
         if existing:
             record_id, run_id, key, accepted_hash, status, created_at, revision = existing
+            lock.release()
             if accepted_hash != fingerprint:
                 raise SubmissionConflict("Idempotency key conflicts with the accepted payload.")
             return {"id": record_id, "run_id": run_id, "idempotency_key": key,
                     "status": status, "revision": revision, "created": False,
                     "created_at": created_at.isoformat() if created_at else None}
-        return self.create(values)._submission_receipt(True)
+        try:
+            return self.create(values)._submission_receipt(True)
+        except Exception:
+            lock.release()
+            raise
 
     def _submission_receipt(self, created):
         self.ensure_one()
@@ -463,6 +470,27 @@ class FacodiPipelineRun(models.Model):
 
     def action_cancel(self, expected_revision=None):
         return self._apply_command("cancel", expected_revision)
+
+    def _action_open_command(self, command):
+        self.ensure_one()
+        wizard = self.env["facodi.pipeline.command"]._create_for_run(self, command)
+        return {
+            "type": "ir.actions.act_window",
+            "name": dict(wizard._fields["command"].selection).get(command),
+            "res_model": "facodi.pipeline.command",
+            "res_id": wizard.id,
+            "view_mode": "form",
+            "target": "new",
+        }
+
+    def action_open_retry(self):
+        return self._action_open_command("retry")
+
+    def action_open_cancel(self):
+        return self._action_open_command("cancel")
+
+    def action_open_input(self):
+        return self._action_open_command("input")
 
     def action_supply_transcript(self, raw_content, idempotency_key, expected_revision=None):
         """Create an explicit input revision; never replace the accepted source."""

@@ -9,6 +9,7 @@
     "data": [
         "security/pipeline_security.xml",
         "security/ir.model.access.csv",
+        "views/pipeline_views.xml",
         "data/ir_cron_data.xml",
     ],
     "installable": True,
