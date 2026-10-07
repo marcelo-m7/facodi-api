@@ -114,6 +114,7 @@ class FacodiPipelineRun(models.Model):
     input_revision_ids = fields.One2many("facodi.pipeline.run", "input_parent_id", readonly=True)
     attachment_id = fields.Many2one("ir.attachment", readonly=True, ondelete="restrict")
     attachment_digest = fields.Char(readonly=True)
+    attachment_name_snapshot = fields.Char(readonly=True)
     existing_slide_id = fields.Many2one("slide.slide", readonly=True, ondelete="restrict")
     existing_slide_hash = fields.Char(readonly=True)
     provider_config_json = fields.Text(readonly=True)
@@ -328,7 +329,7 @@ class FacodiPipelineRun(models.Model):
             content, digest, filename = self._attachment_details(
                 self.attachment_id.id, self.target_channel_id.id, accepted_run=self,
             )
-            if digest != self.attachment_digest:
+            if digest != self.attachment_digest or filename != self.attachment_name_snapshot:
                 raise PipelineSourceError('ATTACHMENT_CHANGED')
         return ContentSource(
             source_type=SourceType(self.source_type), url=self.source_url,
@@ -434,7 +435,8 @@ class FacodiPipelineRun(models.Model):
                 "name": vals["name"] or vals["title"] or "Content intake",
             })
             if vals['attachment_id']:
-                vals['attachment_digest'] = self._attachment_details(vals['attachment_id'], channel.id)[1]
+                _content, digest, filename = self._attachment_details(vals['attachment_id'], channel.id)
+                vals.update(attachment_digest=digest, attachment_name_snapshot=filename)
             if vals['existing_slide_id']:
                 slide = self._authorize_existing_slide(vals['existing_slide_id'], channel.id)
                 self._validate_existing_slide_source(slide, vals)
@@ -705,6 +707,9 @@ class FacodiPipelineRun(models.Model):
                     or not self.published_slide_id.is_published
                     or not self.published_slide_id.website_published):
                 raise UserError("Publication receipt requires reconciliation with the canonical course/content.")
+            if (self.existing_slide_id
+                    and self._canonical_source_hash(self.published_slide_id) != self.existing_slide_hash):
+                raise UserError("Canonical content changed after intake and requires reconciliation.")
             if ("facodi.learning.content.review" in self.env
                     and self.published_slide_id._facodi_requires_review()
                     and not self.published_slide_id._facodi_has_approved_review()):

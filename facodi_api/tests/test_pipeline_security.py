@@ -192,6 +192,7 @@ class TestPipelineSecurity(TransactionCase):
         })
         run = self.Run.create(dict(self.values('attachment'), source_type='document', raw_content='', attachment_id=attachment.id))
         self.assertTrue(run.attachment_digest)
+        self.assertEqual(run.attachment_name_snapshot, 'original.txt')
         self.assertTrue(run.action_execute_pipeline())
         self.assertEqual(run.status, 'waiting_review')
         self.assertEqual(run.chunks_count, 1)
@@ -247,6 +248,23 @@ class TestPipelineSecurity(TransactionCase):
         with self.assertRaises(ValidationError):
             self.Run.create(dict(self.values('existing-mismatch'), existing_slide_id=slide.id,
                                  raw_content='Unrelated caller content.'))
+
+    def test_publication_replay_rejects_changed_canonical_slide(self):
+        self.operator.write({'group_ids': [Command.link(self.env.ref('facodi_api.group_pipeline_reviewer').id)]})
+        slide = self.env['slide.slide'].with_user(self.operator).create({
+            'name': 'Replay original', 'channel_id': self.channel.id,
+            'slide_category': 'article', 'html_content': '<p>Original replay evidence.</p>',
+        })
+        run = self.Run.create(dict(
+            self.values('published-replay-change'),
+            existing_slide_id=slide.id,
+            raw_content='Original replay evidence.',
+        ))
+        self.assertTrue(run.action_execute_pipeline())
+        self.assertTrue(run.action_approve_and_publish())
+        slide.write({'html_content': '<p>Changed after publication.</p>'})
+        with self.assertRaises(UserError):
+            run.action_approve_and_publish()
 
     def test_run_scoped_attachment_can_be_published_by_reviewer(self):
         import base64
