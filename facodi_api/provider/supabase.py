@@ -55,9 +55,11 @@ class SupabaseProvider(ProviderAdapter):
         function_name = self._resolved_function_name(function_name)
         endpoint = f"{url}/functions/v1/{function_name}"
 
+        # Modern Supabase sb_secret_* keys are API keys, not JWTs. Sending one
+        # as Authorization: Bearer makes the Edge gateway try to parse it as a
+        # JWT and reject an otherwise valid server-to-server request.
         headers = {
             "apikey": secret,
-            "Authorization": f"Bearer {secret}",
             "Content-Type": "application/json",
             "user-agent": "FACODI-Odoo/19 SupabaseProvider",
         }

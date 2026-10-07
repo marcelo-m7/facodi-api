@@ -35,7 +35,7 @@ class ProviderContractTest(unittest.TestCase):
     def test_supabase_dispatch_uses_env_and_returns_payload(self):
         with mock.patch.dict(
             os.environ,
-            {"SUPABASE_URL": "https://example.supabase.co", "SUPABASE_SECRET_KEY": "secret-key"},
+            {"SUPABASE_URL": "https://example.supabase.co", "SUPABASE_SECRET_KEY": "sb_secret_test"},
             clear=False,
         ), mock.patch(ROOT_MODULE + ".provider.supabase.requests.post", return_value=FakeResponse({"ok": True})) as request_mock:
             result = FacodiApiService.dispatch(
@@ -48,8 +48,9 @@ class ProviderContractTest(unittest.TestCase):
         request_mock.assert_called_once()
         endpoint = request_mock.call_args.args[0]
         self.assertEqual(endpoint, "https://example.supabase.co/functions/v1/v2_ingest_youtube_video")
-        self.assertEqual(request_mock.call_args.kwargs["headers"]["apikey"], "secret-key")
-        self.assertEqual(request_mock.call_args.kwargs["headers"]["Authorization"], "Bearer secret-key")
+        headers = request_mock.call_args.kwargs["headers"]
+        self.assertEqual(headers["apikey"], "sb_secret_test")
+        self.assertNotIn("Authorization", headers)
 
     def test_supabase_uses_project_default_functions(self):
         with mock.patch.dict(
