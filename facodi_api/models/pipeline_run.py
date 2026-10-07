@@ -10,7 +10,7 @@ import os
 import uuid
 from html import escape
 
-from odoo import api, fields, models
+from odoo import api, fields, models, tools
 from odoo.exceptions import AccessError, UserError, ValidationError
 
 from ..core.contracts.dtos import (
@@ -22,6 +22,8 @@ from ..core.contracts.dtos import (
     TargetEntity,
 )
 from ..core.pipeline.runner import PipelineRunner
+from ..core.enrichment.provider import BaselineDeterministicProvider, GeminiStructuredProvider, EnrichmentError
+from ..core.ingestion.document import DocumentAcquisitionError
 from ..core.contracts.lifecycle import (
     InvalidTransition, RevisionConflict, command_transition, failure_status,
 )
@@ -113,6 +115,8 @@ class FacodiPipelineRun(models.Model):
     attachment_digest = fields.Char(readonly=True)
     existing_slide_id = fields.Many2one("slide.slide", readonly=True, ondelete="restrict")
     existing_slide_hash = fields.Char(readonly=True)
+    provider_config_json = fields.Text(readonly=True)
+    catalog_snapshot_json = fields.Text(readonly=True)
 
     # Metrics
     execution_time = fields.Float(string="Total Execution Time (s)")
@@ -194,6 +198,52 @@ class FacodiPipelineRun(models.Model):
             slide = self._authorize_existing_slide(vals['existing_slide_id'], vals['target_channel_id'])
             payload['existing_slide_hash'] = self._canonical_source_hash(slide)
         return hashlib.sha256(json.dumps(payload, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+    @api.model
+    def _server_provider_configuration(self):
+        params = self.env['ir.config_parameter'].sudo()
+        provider = params.get_param('facodi_api.enrichment_provider', 'baseline')
+        if provider == 'baseline':
+            return {'provider': 'baseline', 'version': 'regex-frequency-v2-evidence'}
+        if provider != 'gemini':
+            raise ValidationError('Unsupported enrichment provider configuration.')
+        model = params.get_param('facodi_api.enrichment_model', '')
+        try:
+            budget = int(params.get_param('facodi_api.enrichment_max_output_tokens', '4096'))
+            instance = GeminiStructuredProvider(model=model, max_output_tokens=budget)
+        except (TypeError, ValueError):
+            raise ValidationError('Configure a supported enrichment model and bounded output budget.') from None
+        return {'provider': 'gemini', **instance.cache_identity()}
+
+    def _accepted_enrichment_provider(self):
+        config = json.loads(self.provider_config_json or '{"provider":"baseline"}')
+        if config.get('provider') == 'baseline':
+            return BaselineDeterministicProvider()
+        if config.get('provider') == 'gemini':
+            return GeminiStructuredProvider(model=config['model'], max_output_tokens=config['max_output_tokens'])
+        raise ValidationError('Accepted enrichment provider configuration is invalid.')
+
+    @api.model
+    def _build_catalog_snapshot(self, channel):
+        domain = [('active', '=', True), ('website_id', '=', channel.website_id.id),
+                  ('website_id.company_id', '=', self.env.company.id)]
+        channels = self.env['slide.channel'].search(domain, limit=5001, order='id')
+        if len(channels) > 5000:
+            raise ValidationError('Catalog exceeds the explicit 5000-course snapshot budget; narrow the processing scope.')
+        targets = [TargetEntity(id='channel_%s' % course.id, type='course', name=course.name,
+                                description=tools.html2plaintext(course.description or '')[:8000],
+                                tags=course.tag_ids.mapped('name'), topics=[],
+                                metadata={'model': 'slide.channel', 'res_id': course.id,
+                                          'website_id': course.website_id.id, 'company_id': self.env.company.id})
+                   for course in channels]
+        identity = hashlib.sha256(json.dumps([target.to_dict() for target in targets], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        snapshot = CatalogSnapshot(snapshot_id='catalog-%s-%s' % (channel.website_id.id, identity[:20]),
+                                   created_at=fields.Datetime.now().isoformat(), targets=targets,
+                                   metadata={'company_id': self.env.company.id, 'website_id': channel.website_id.id,
+                                             'ranking': 'lexical score; not calibrated probability'})
+        if len(json.dumps(snapshot.to_dict()).encode()) > 4 * 1024 * 1024:
+            raise ValidationError('Catalog exceeds the explicit four MiB snapshot budget.')
+        return snapshot
 
     @api.model
     def _authorize_existing_slide(self, slide_id, channel_id):
@@ -348,6 +398,8 @@ class FacodiPipelineRun(models.Model):
             if vals['existing_slide_id']:
                 slide = self._authorize_existing_slide(vals['existing_slide_id'], channel.id)
                 vals['existing_slide_hash'] = self._canonical_source_hash(slide)
+            vals['provider_config_json'] = json.dumps(self._server_provider_configuration(), sort_keys=True)
+            vals['catalog_snapshot_json'] = json.dumps(self._build_catalog_snapshot(channel).to_dict(), ensure_ascii=False)
             prepared.append(vals)
         clean_context = {key: value for key, value in self.env.context.items() if not key.startswith("default_")}
         trusted_model = self.with_context(clean_context)
@@ -466,32 +518,14 @@ class FacodiPipelineRun(models.Model):
         self._authorize_channel(self.target_channel_id, self.company_id, self.website_id)
         self._set_execution_values({"status": "running", "error_message": False, "attempt_count": self.attempt_count + 1})
 
-        # Build CatalogSnapshot from Odoo courses / subjects if available
-        targets = []
-        try:
-            # Check if slide.channel exists (Odoo eLearning)
-            if "slide.channel" in self.env:
-                channels = self.env["slide.channel"].search([("active", "=", True), ("website_id", "=", self.website_id.id), ("website_id.company_id", "=", self.company_id.id)], limit=50)
-                for c in channels:
-                    targets.append(
-                        TargetEntity(
-                            id=f"channel_{c.id}",
-                            type="course",
-                            name=c.name,
-                            tags=[t.name for t in getattr(c, "tag_ids", [])],
-                            topics=[],
-                        )
-                    )
-        except Exception:
-            _logger.warning("Could not load slide.channel for catalog snapshot", exc_info=False)
-
-        catalog = CatalogSnapshot(
-            snapshot_id=f"snap-{self.id}",
-            created_at=fields.Datetime.now().isoformat(),
-            targets=targets,
-        )
-
-        runner = PipelineRunner(storage_dir=os.path.join(os.environ.get("FACODI_PIPELINE_STORAGE", "/tmp/facodi-pipeline-v2"), self.env.cr.dbname, str(self.id)))
+        # New requests retain their authorized catalog. Pre-snapshot accepted
+        # receipts bind it once under this same row lock, never on every retry.
+        if not self.catalog_snapshot_json:
+            self._set_execution_values({'catalog_snapshot_json': json.dumps(self._build_catalog_snapshot(self.target_channel_id).to_dict(), ensure_ascii=False)})
+        catalog = CatalogSnapshot.from_dict(json.loads(self.catalog_snapshot_json))
+        storage = os.environ.get('FACODI_PIPELINE_STORAGE') or os.path.join(tools.config['data_dir'], 'facodi-pipeline')
+        runner = PipelineRunner(enrichment_provider=self._accepted_enrichment_provider(),
+                                storage_dir=os.path.join(storage, self.env.cr.dbname, str(self.id)))
         try:
             source = self._prepare_content_source()
             res_run = runner.run_pipeline(
@@ -512,7 +546,7 @@ class FacodiPipelineRun(models.Model):
             return True
         except Exception as exc:
             from ..core.ingestion.youtube import YouTubeAcquisitionError
-            code = exc.code if isinstance(exc, (YouTubeAcquisitionError, PipelineSourceError)) else "PIPELINE_FAILED"
+            code = exc.code if isinstance(exc, (YouTubeAcquisitionError, PipelineSourceError, DocumentAcquisitionError, EnrichmentError)) else "PIPELINE_FAILED"
             _logger.error("Pipeline execution failed run=%s code=%s", self.run_id, code, exc_info=False)
             self._set_execution_values({"status": failure_status(code), "error_message": code})
             if self.task_id:
