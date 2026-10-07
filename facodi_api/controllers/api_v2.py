@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 
@@ -38,11 +39,11 @@ class FacodiApiV2Controller(http.Controller):
         if not request.httprequest.is_json:
             raise UnsupportedMediaType("Content-Type must be application/json")
         try:
-            request.httprequest.max_content_length = 262145
-            data = read_request_object(
-                request.httprequest.stream, request.httprequest.content_length,
-                terminated=bool(request.httprequest.environ.get("wsgi.input_terminated")),
-            )
+            # Odoo 19 exposes get_data, but deliberately hides the WSGI stream.
+            # Werkzeug enforces this limit for Content-Length and chunked bodies.
+            request.httprequest.max_content_length = 262144
+            body = request.httprequest.get_data(cache=False)
+            data = read_request_object(io.BytesIO(body), len(body), terminated=True)
         except PayloadTooLarge:
             raise RequestEntityTooLarge("Payload too large") from None
         except InvalidPayload:
