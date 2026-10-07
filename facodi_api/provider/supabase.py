@@ -15,6 +15,8 @@ _FUNCTION_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _DEFAULT_FUNCTIONS = {
     "resource.analyze": "v3_analyze_learning_resource",
     "resource.metadata": "v3_discover_resource_metadata",
+    "video.ingest": "v3_ingest_youtube_video",
+    "video_ingest": "v3_ingest_youtube_video",
     "analysis": "v3_analyze_learning_resource",
     "metadata": "v3_discover_resource_metadata",
 }
@@ -31,10 +33,8 @@ class SupabaseProvider(ProviderAdapter):
             normalized = (
                 self.config.get("video_ingest_function")
                 or os.getenv("FACODI_SUPABASE_VIDEO_INGEST_FUNCTION")
-                or ""
+                or _DEFAULT_FUNCTIONS[normalized]
             ).strip()
-            if not normalized:
-                raise RuntimeError("Supabase video ingest function is not configured")
         else:
             normalized = _DEFAULT_FUNCTIONS.get(normalized, normalized)
         if not _FUNCTION_RE.fullmatch(normalized):
