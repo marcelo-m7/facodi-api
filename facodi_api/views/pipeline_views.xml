@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_facodi_pipeline_run_list" model="ir.ui.view">
+        <field name="name">facodi.pipeline.run.list</field>
+        <field name="model">facodi.pipeline.run</field>
+        <field name="arch" type="xml">
+            <list create="false" delete="false">
+                <field name="name"/>
+                <field name="source_type"/>
+                <field name="target_channel_id"/>
+                <field name="owner_id"/>
+                <field name="status"/>
+                <field name="revision"/>
+                <field name="create_date"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_facodi_pipeline_run_form" model="ir.ui.view">
+        <field name="name">facodi.pipeline.run.form</field>
+        <field name="model">facodi.pipeline.run</field>
+        <field name="arch" type="xml">
+            <form create="false" delete="false">
+                <header>
+                    <button name="action_open_retry" type="object" string="Retry"
+                            invisible="status not in ['failed', 'waiting_input']"/>
+                    <button name="action_open_cancel" type="object" string="Cancel"
+                            invisible="status in ['cancelled', 'published']"/>
+                    <button name="action_open_input" type="object" string="Supply transcript"
+                            invisible="status != 'waiting_input' or source_type != 'youtube'"/>
+                    <field name="status" widget="statusbar"/>
+                </header>
+                <sheet>
+                    <group>
+                        <group>
+                            <field name="name"/>
+                            <field name="run_id"/>
+                            <field name="source_type"/>
+                            <field name="target_channel_id"/>
+                        </group>
+                        <group>
+                            <field name="owner_id"/>
+                            <field name="company_id"/>
+                            <field name="website_id"/>
+                            <field name="revision"/>
+                        </group>
+                    </group>
+                    <group>
+                        <field name="error_message"/>
+                    </group>
+                </sheet>
+                <chatter/>
+            </form>
+        </field>
+    </record>
+
+    <record id="view_facodi_pipeline_command_form" model="ir.ui.view">
+        <field name="name">facodi.pipeline.command.form</field>
+        <field name="model">facodi.pipeline.command</field>
+        <field name="arch" type="xml">
+            <form>
+                <group>
+                    <field name="run_id"/>
+                    <field name="command"/>
+                    <field name="expected_revision"/>
+                    <field name="raw_content" invisible="command != 'input'" required="command == 'input'"/>
+                    <field name="idempotency_key" invisible="command != 'input'" required="command == 'input'"/>
+                </group>
+                <footer>
+                    <button name="action_apply" type="object" string="Confirm" class="btn-primary"/>
+                    <button string="Discard" special="cancel" class="btn-secondary"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_facodi_pipeline_runs" model="ir.actions.act_window">
+        <field name="name">Pipeline Runs</field>
+        <field name="res_model">facodi.pipeline.run</field>
+        <field name="view_mode">list,form</field>
+    </record>
+
+    <menuitem id="menu_facodi_pipeline_root" name="FACODI Pipeline"
+              groups="facodi_api.group_pipeline_operator" sequence="90"/>
+    <menuitem id="menu_facodi_pipeline_runs" name="Runs"
+              parent="menu_facodi_pipeline_root" action="action_facodi_pipeline_runs"
+              groups="facodi_api.group_pipeline_operator" sequence="10"/>
+</odoo>
