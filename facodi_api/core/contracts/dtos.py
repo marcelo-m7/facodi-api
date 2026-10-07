@@ -55,6 +55,7 @@ class RunStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     WAITING_REVIEW = "waiting_review"
+    WAITING_INPUT = "waiting_input"
     PUBLISHED = "published"
 
 

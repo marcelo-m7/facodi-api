@@ -68,71 +68,21 @@ class FacodiApiV2Controller(http.Controller):
             raise BadRequest("Synchronous execution is disabled")
         values = {key: data[key] for key in ("source_type", "title", "raw_content", "language", "is_manual_transcript") if key in data}
         values.update({"source_url": data.get("url"), "target_channel_id": data.get("channel_id"), "idempotency_key": idempotency_key})
+        from ..models.pipeline_run import SubmissionBusy, SubmissionConflict
         try:
-            values = RunModel._normalize_submission(values)
-            channel = request.env["slide.channel"].browse(values["target_channel_id"])
-            RunModel._authorize_channel(channel, request.env.company)
+            receipt = RunModel.submit(values)
         except ValidationError:
             raise BadRequest("Invalid content submission") from None
         except AccessError:
             raise Forbidden("Course is outside the authorized scope") from None
-        fingerprint = RunModel._submission_fingerprint(values)
-        scope = [
-            ("idempotency_key", "=", idempotency_key),
-            ("owner_id", "=", request.env.user.id),
-            ("company_id", "=", request.env.company.id),
-        ]
-        lock_key = f"facodi-pipeline:{request.env.company.id}:{request.env.user.id}:{idempotency_key}"
-        lock_cursor = request.env.registry.cursor()
-        try:
-            lock_cursor.execute("SET LOCAL lock_timeout = '10s'")
-            lock_cursor.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))", [lock_key])
-            lock_cursor.commit()
-        except Exception:
-            lock_cursor.close()
-            raise ServiceUnavailable("Submission busy; retry with the same idempotency key.") from None
-
-        def release_idempotency_lock():
-            if lock_cursor.closed:
-                return
-            try:
-                lock_cursor.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", [lock_key])
-            finally:
-                lock_cursor.close()
-
-        request.env.cr.postcommit.add(release_idempotency_lock)
-        request.env.cr.postrollback.add(release_idempotency_lock)
-        lock_cursor.execute(
-            """SELECT run_id, idempotency_key, request_hash, status, create_date
-               FROM facodi_pipeline_run
-               WHERE idempotency_key = %s AND owner_id = %s AND company_id = %s
-               LIMIT 1""",
-            [idempotency_key, request.env.user.id, request.env.company.id],
-        )
-        existing = lock_cursor.fetchone()
-        if existing:
-            existing_run_id, existing_key, existing_hash, existing_status, created_at = existing
-            if existing_hash != fingerprint:
-                return Response(json.dumps({"error": "idempotency_conflict"}), status=409, mimetype="application/json")
-            resp = {
-                "run_id": existing_run_id,
-                "idempotency_key": existing_key,
-                "status": existing_status,
-                "created_at": created_at.isoformat() if created_at else None,
-            }
-            return Response(json.dumps(resp), status=200, mimetype="application/json")
-
-        run_record = RunModel.create(values)
-
-        resp = {
-            "run_id": run_record.run_id,
-            "idempotency_key": run_record.idempotency_key,
-            "status": run_record.status,
-            "links": {
-                "self": f"/facodi/api/v2/pipeline/runs/{run_record.run_id}",
-            },
-        }
-        return Response(json.dumps(resp), status=202, mimetype="application/json")
+        except SubmissionBusy:
+            raise ServiceUnavailable("Submission busy; retry with the same key.") from None
+        except SubmissionConflict:
+            return Response(json.dumps({"error": "idempotency_conflict"}), status=409, mimetype="application/json")
+        created = receipt.pop("created")
+        receipt.pop("id")
+        receipt["links"] = {"self": f"/facodi/api/v2/pipeline/runs/{receipt['run_id']}"}
+        return Response(json.dumps(receipt), status=202 if created else 200, mimetype="application/json")
 
     @http.route("/facodi/api/v2/pipeline/runs/<string:run_id>", type="http", auth="bearer", methods=["GET"], csrf=False)
     def get_pipeline_run(self, run_id, **kwargs):
@@ -148,6 +98,8 @@ class FacodiApiV2Controller(http.Controller):
             "run_id": run.run_id,
             "idempotency_key": run.idempotency_key,
             "status": run.status,
+            "revision": run.revision,
+            "attempt_count": run.attempt_count,
             "title": run.title,
             "source_type": run.source_type,
             "source_url": run.source_url,
@@ -197,3 +149,44 @@ class FacodiApiV2Controller(http.Controller):
             status=200,
             mimetype="application/json",
         )
+
+    @http.route("/facodi/api/v2/pipeline/runs/<string:run_id>/<string:command>", type="http", auth="bearer", methods=["POST"], csrf=False, max_content_length=262145)
+    def pipeline_command(self, run_id, command, **kwargs):
+        self._check_auth()
+        if command not in {"retry", "cancel", "input"}:
+            raise NotFound("Command not found.")
+        if not request.httprequest.is_json:
+            raise UnsupportedMediaType("Content-Type must be application/json")
+        run = request.env["facodi.pipeline.run"].search([("run_id", "=", run_id)], limit=1)
+        if not run:
+            raise NotFound("Run not found.")
+        try:
+            request.httprequest.max_content_length = 262145
+            body = request.httprequest.get_data(cache=False)
+            data = read_request_object(io.BytesIO(body), len(body), terminated=True)
+        except PayloadTooLarge:
+            raise RequestEntityTooLarge("Payload too large") from None
+        except InvalidPayload:
+            raise BadRequest("Invalid JSON body") from None
+        allowed = {"expected_revision"} | ({"raw_content", "idempotency_key"} if command == "input" else set())
+        if set(data) - allowed:
+            raise BadRequest("Unsupported command fields")
+        from ..core.contracts.lifecycle import InvalidTransition, RevisionConflict
+        from ..models.pipeline_run import SubmissionBusy, SubmissionConflict
+        from odoo.exceptions import AccessError, ValidationError
+        try:
+            if command == "input":
+                run = run.action_supply_transcript(data.get("raw_content"), data.get("idempotency_key"), data.get("expected_revision"))
+            elif command == "retry":
+                run.action_retry(data.get("expected_revision"))
+            else:
+                run.action_cancel(data.get("expected_revision"))
+        except (RevisionConflict, SubmissionConflict):
+            return Response(json.dumps({"error": "revision_or_idempotency_conflict"}), status=409, mimetype="application/json")
+        except (InvalidTransition, ValidationError):
+            raise BadRequest("Command cannot be applied to this input or state") from None
+        except AccessError:
+            raise Forbidden("Run is outside the authorized scope") from None
+        except SubmissionBusy:
+            raise ServiceUnavailable("Submission busy; retry with the same key.") from None
+        return Response(json.dumps({"run_id": run.run_id, "status": run.status, "revision": run.revision}), status=202 if command == "input" else 200, mimetype="application/json")

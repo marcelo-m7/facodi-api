@@ -21,8 +21,19 @@ from ..core.contracts.dtos import (
     TargetEntity,
 )
 from ..core.pipeline.runner import PipelineRunner
+from ..core.contracts.lifecycle import (
+    InvalidTransition, RevisionConflict, command_transition, failure_status,
+)
 
 _logger = logging.getLogger(__name__)
+
+
+class SubmissionConflict(ValueError):
+    pass
+
+
+class SubmissionBusy(ValueError):
+    pass
 
 
 class FacodiPipelineRun(models.Model):
@@ -68,6 +79,7 @@ class FacodiPipelineRun(models.Model):
             ("waiting_review", "Waiting Manager Review"),
             ("published", "Published"),
             ("failed", "Failed"),
+            ("waiting_input", "Waiting for Input"),
             ("cancelled", "Cancelled"),
         ],
         string="Status",
@@ -85,6 +97,11 @@ class FacodiPipelineRun(models.Model):
     error_message = fields.Text(string="Error Message")
     artifacts_json = fields.Text(string="Artifacts JSON (Cache)")
     metadata_json = fields.Text(string="Metadata JSON")
+    revision = fields.Integer(default=0, readonly=True)
+    attempt_count = fields.Integer(default=0, readonly=True)
+    history_json = fields.Text(readonly=True)
+    input_parent_id = fields.Many2one("facodi.pipeline.run", readonly=True, ondelete="restrict")
+    input_revision_ids = fields.One2many("facodi.pipeline.run", "input_parent_id", readonly=True)
 
     # Metrics
     execution_time = fields.Float(string="Total Execution Time (s)")
@@ -152,6 +169,67 @@ class FacodiPipelineRun(models.Model):
         return hashlib.sha256(json.dumps(payload, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
     @api.model
+    def submit(self, values):
+        """Authorized async command used by HTTP and in-process adapters.
+
+        The dedicated cursor observes committed intake even when the caller's
+        REPEATABLE READ snapshot predates the competing transaction.
+        """
+        self._check_pipeline_enabled()
+        self.check_access("create")
+        values = self._normalize_submission(values)
+        self._authorize_channel(self.env["slide.channel"].browse(values["target_channel_id"]), self.env.company)
+        fingerprint = self._submission_fingerprint(values)
+        scope = [("owner_id", "=", self.env.uid), ("company_id", "=", self.env.company.id),
+                 ("idempotency_key", "=", values["idempotency_key"])]
+        local = self.search(scope, limit=1)
+        if local:
+            if local.request_hash != fingerprint:
+                raise SubmissionConflict("Idempotency key conflicts with the accepted payload.")
+            return local._submission_receipt(False)
+        lock_key = f"facodi-pipeline:{self.env.company.id}:{self.env.uid}:{values['idempotency_key']}"
+        lock_cursor = self.env.registry.cursor()
+        try:
+            lock_cursor.execute("SET LOCAL lock_timeout = '10s'")
+            lock_cursor.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))", [lock_key])
+            lock_cursor.commit()
+        except Exception:
+            lock_cursor.close()
+            raise SubmissionBusy("Submission busy; retry with the same key.") from None
+
+        def release():
+            if lock_cursor.closed:
+                return
+            try:
+                lock_cursor.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", [lock_key])
+            finally:
+                lock_cursor.close()
+
+        self.env.cr.postcommit.add(release)
+        self.env.cr.postrollback.add(release)
+        lock_cursor.execute(
+            """SELECT id, run_id, idempotency_key, request_hash, status, create_date, revision
+               FROM facodi_pipeline_run WHERE owner_id=%s AND company_id=%s AND idempotency_key=%s LIMIT 1""",
+            [self.env.uid, self.env.company.id, values["idempotency_key"]],
+        )
+        existing = lock_cursor.fetchone()
+        if existing:
+            record_id, run_id, key, accepted_hash, status, created_at, revision = existing
+            if accepted_hash != fingerprint:
+                raise SubmissionConflict("Idempotency key conflicts with the accepted payload.")
+            return {"id": record_id, "run_id": run_id, "idempotency_key": key,
+                    "status": status, "revision": revision, "created": False,
+                    "created_at": created_at.isoformat() if created_at else None}
+        return self.create(values)._submission_receipt(True)
+
+    def _submission_receipt(self, created):
+        self.ensure_one()
+        self.check_access("read")
+        return {"id": self.id, "run_id": self.run_id, "idempotency_key": self.idempotency_key,
+                "status": self.status, "revision": self.revision, "created": created,
+                "created_at": self.create_date.isoformat() if self.create_date else None}
+
+    @api.model
     def _authorize_channel(self, channel, company, website=None, *, publication=False):
         if not channel.exists():
             raise ValidationError("Course not found.")
@@ -195,7 +273,88 @@ class FacodiPipelineRun(models.Model):
 
     def _set_execution_values(self, vals):
         """Private capability: never authorize trusted writes with caller context."""
+        return self._record_transition(vals)
+
+    def _record_transition(self, vals, *, command=None):
+        self.ensure_one()
+        vals = dict(vals)
+        if "status" in vals and vals["status"] != self.status:
+            history = json.loads(self.history_json or "[]")
+            history.append({
+                "from": self.status, "to": vals["status"],
+                "from_revision": self.revision, "revision": self.revision + 1,
+                "command": command, "actor_id": self.env.uid,
+                "at": fields.Datetime.now().isoformat(),
+                "reason": vals.get("error_message") or None,
+            })
+            vals.update(revision=self.revision + 1, history_json=json.dumps(history))
         return super().write(vals)
+
+    def _lock_command(self):
+        self.ensure_one()
+        self._check_pipeline_enabled()
+        self.check_access("write")
+        self.env.cr.execute("SELECT id FROM facodi_pipeline_run WHERE id = %s FOR UPDATE SKIP LOCKED", [self.id])
+        if not self.env.cr.fetchone():
+            raise RevisionConflict("Run is busy; retry after reading its revision.")
+        self.invalidate_recordset()
+        if self.legacy_quarantined or self.env.company != self.company_id:
+            raise AccessError("Commands require a verified run in its recorded company.")
+        self._authorize_channel(self.target_channel_id, self.company_id, self.website_id)
+
+    def _apply_command(self, command, expected_revision):
+        self._lock_command()
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise InvalidTransition("A nonnegative expected_revision is required.")
+        # Replay identifies the exact already-applied command, never a fresh retry.
+        if any(event.get("command") == command and event.get("from_revision") == expected_revision
+               for event in json.loads(self.history_json or "[]")):
+            return True
+        state = command_transition(self.status, command, self.revision, expected_revision)
+        if command == "retry" and self.attempt_count >= 20:
+            raise InvalidTransition("Attempt budget exhausted; submit a reviewed new request.")
+        self._record_transition({"status": state, "error_message": False}, command=command)
+        return True
+
+    def action_retry(self, expected_revision=None):
+        return self._apply_command("retry", expected_revision)
+
+    def action_cancel(self, expected_revision=None):
+        return self._apply_command("cancel", expected_revision)
+
+    def action_supply_transcript(self, raw_content, idempotency_key, expected_revision=None):
+        """Create an explicit input revision; never replace the accepted source."""
+        self._lock_command()
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise InvalidTransition("A nonnegative expected_revision is required.")
+        if self.source_type != "youtube":
+            raise InvalidTransition("Transcript input is available only for YouTube sources.")
+        values = {
+            "source_type": "youtube", "source_url": self.source_url,
+            "title": self.title, "language": self.language,
+            "raw_content": raw_content, "is_manual_transcript": True,
+            "target_channel_id": self.target_channel_id.id,
+            "idempotency_key": idempotency_key,
+        }
+        values = self._normalize_submission(values)
+        child = self.input_revision_ids.filtered(lambda run: run.idempotency_key == idempotency_key)
+        if child:
+            child.check_access("read")
+            if child.request_hash != self._submission_fingerprint(values):
+                raise SubmissionConflict("Input revision payload conflicts with its key.")
+            return child
+        if self.revision != expected_revision:
+            raise RevisionConflict("Run changed before new input was supplied.")
+        if self.status != "waiting_input":
+            raise InvalidTransition("Only a run waiting for input accepts a new transcript revision.")
+        with self.env.cr.savepoint():
+            receipt = self.submit(values)
+            child = self.browse(receipt["id"])
+            if not receipt["created"]:
+                raise SubmissionConflict("Input revision key already belongs to another request.")
+            child._set_execution_values({"input_parent_id": self.id})
+            self._record_transition({"status": "cancelled", "error_message": "SUPERSEDED_BY_INPUT"}, command="input")
+        return child
 
     def action_execute_pipeline(self):
         """Execute the pure Python pipeline runner and update record state."""
@@ -211,7 +370,7 @@ class FacodiPipelineRun(models.Model):
         if self.env.company != self.company_id:
             raise AccessError("Execution must use the recorded company.")
         self._authorize_channel(self.target_channel_id, self.company_id, self.website_id)
-        self._set_execution_values({"status": "running", "error_message": False})
+        self._set_execution_values({"status": "running", "error_message": False, "attempt_count": self.attempt_count + 1})
 
         # Build ContentSource
         source = ContentSource(
@@ -269,7 +428,7 @@ class FacodiPipelineRun(models.Model):
             from ..core.ingestion.youtube import YouTubeAcquisitionError
             code = exc.code if isinstance(exc, YouTubeAcquisitionError) else "PIPELINE_FAILED"
             _logger.error("Pipeline execution failed run=%s code=%s", self.run_id, code, exc_info=False)
-            self._set_execution_values({"status": "failed", "error_message": code})
+            self._set_execution_values({"status": failure_status(code), "error_message": code})
             if self.task_id:
                 self.task_id.message_post(body="Falha na execução do pipeline.")
             return False

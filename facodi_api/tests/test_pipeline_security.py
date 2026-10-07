@@ -112,3 +112,75 @@ class TestPipelineSecurity(TransactionCase):
         self.env['facodi.pipeline.run'].cron_process_received_runs()
         second.invalidate_recordset()
         self.assertEqual(second.status, 'waiting_review')
+
+    def test_common_submission_is_async_and_idempotent(self):
+        first = self.Run.submit(self.values('facade'))
+        again = self.Run.submit(self.values('facade'))
+        self.assertTrue(first['created'])
+        self.assertFalse(again['created'])
+        self.assertEqual(first['id'], again['id'])
+        run = self.Run.browse(first['id'])
+        self.assertEqual(run.status, 'received')
+        self.assertFalse(run.metadata_json)
+        self.assertEqual(run.attempt_count, 0)
+        from odoo.addons.facodi_api.models.pipeline_run import SubmissionConflict
+        with self.assertRaises(SubmissionConflict):
+            self.Run.submit(dict(self.values('facade'), raw_content='Different source.'))
+
+    def test_cancel_command_replays_without_new_state_or_history(self):
+        run = self.Run.create(self.values('cancel-replay'))
+        run.action_cancel(expected_revision=0)
+        self.assertEqual(run.status, 'cancelled')
+        self.assertEqual(run.revision, 1)
+        history = run.history_json
+        run.action_cancel(expected_revision=0)
+        self.assertEqual(run.history_json, history)
+        from odoo.addons.facodi_api.core.contracts.lifecycle import RevisionConflict
+        with self.assertRaises(RevisionConflict):
+            run.action_retry(expected_revision=0)
+
+    def test_blocked_video_input_creates_separate_immutable_revision(self):
+        from odoo.addons.facodi_api.core.ingestion.youtube_transport import YouTubeAcquisitionError
+        run = self.Run.create(dict(self.values('blocked-input'), source_type='youtube',
+                                  source_url='https://www.youtube.com/watch?v=4GVbqYFmGBw', raw_content=''))
+        with patch('odoo.addons.facodi_api.core.ingestion.youtube.acquire_transcript',
+                   side_effect=YouTubeAcquisitionError('YOUTUBE_IP_BLOCKED')):
+            self.assertFalse(run.action_execute_pipeline())
+        self.assertEqual(run.status, 'waiting_input')
+        self.assertEqual(run.error_message, 'YOUTUBE_IP_BLOCKED')
+        revision = run.revision
+        child = run.action_supply_transcript('Original explicit manual test evidence.', 'input-child', revision)
+        self.assertEqual(child.input_parent_id, run)
+        self.assertTrue(child.is_manual_transcript)
+        self.assertEqual(child.status, 'received')
+        self.assertEqual(run.status, 'cancelled')
+        self.assertFalse(run.raw_content)
+        self.assertFalse(run.is_manual_transcript)
+        again = run.action_supply_transcript('Original explicit manual test evidence.', 'input-child', revision)
+        self.assertEqual(child, again)
+        from odoo.addons.facodi_api.models.pipeline_run import SubmissionConflict
+        with self.assertRaises(SubmissionConflict):
+            run.action_supply_transcript('Altered evidence.', 'input-child', revision)
+
+    def test_generated_command_history_is_not_rpc_writable(self):
+        run = self.Run.with_context(default_revision=99, default_history_json='[{"forged":true}]',
+                                    default_input_parent_id=123456).create(self.values('history-guards'))
+        self.assertEqual(run.revision, 0)
+        self.assertFalse(run.history_json)
+        self.assertFalse(run.input_parent_id)
+        for values in ({'revision': 999}, {'history_json': '[]'}, {'input_parent_id': run.id}):
+            with self.assertRaises(AccessError):
+                run.write(values)
+
+    def test_retry_keeps_accepted_input_and_records_attempt(self):
+        run = self.Run.create(self.values('retry-audit'))
+        run._set_execution_values({'status': 'failed', 'error_message': 'PIPELINE_FAILED'})
+        revision = run.revision
+        accepted = (run.request_hash, run.raw_content, run.owner_id.id, run.company_id.id)
+        run.action_retry(revision)
+        run.action_retry(revision)
+        self.assertEqual(run.status, 'received')
+        self.assertEqual((run.request_hash, run.raw_content, run.owner_id.id, run.company_id.id), accepted)
+        self.assertTrue(run.action_execute_pipeline())
+        self.assertEqual(run.attempt_count, 1)
+        self.assertEqual(run.status, 'waiting_review')
