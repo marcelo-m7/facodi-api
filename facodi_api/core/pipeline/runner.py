@@ -87,10 +87,15 @@ class PipelineRunner:
     ) -> PipelineRun:
         """Execute all steps idempotently."""
         run_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "facodi-api-v2:" + idempotency_key)) if idempotency_key else str(uuid.uuid4())
-        fingerprint = hashlib.sha256(json.dumps({"source": source.compute_hash(), "catalog": catalog.to_dict() if catalog else None, "provider": type(self.enrichment_provider).__module__ + "." + type(self.enrichment_provider).__name__, "pipeline_version": "2.0.1"}, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        stable_catalog = {k: v for k, v in catalog.to_dict().items() if k != "created_at"} if catalog else None
+        fingerprint = hashlib.sha256(json.dumps({"source": source.compute_hash(), "catalog": stable_catalog, "provider": type(self.enrichment_provider).__module__ + "." + type(self.enrichment_provider).__name__, "pipeline_version": "2.0.1"}, sort_keys=True, allow_nan=False).encode()).hexdigest()
         
         # Check if already completed under this idempotency_key
         existing = self.load_run(run_id)
+        # Do not silently reprocess pre-UUID artifacts whose input cannot be verified.
+        if not existing and idempotency_key and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", idempotency_key):
+            if self.load_run(idempotency_key):
+                raise ValueError("Legacy artifact requires explicit verified migration")
         if existing and existing.metadata.get("input_fingerprint") != fingerprint:
             raise ValueError("Idempotency conflict: processing inputs changed")
         if existing and existing.status == RunStatus.SUCCEEDED:

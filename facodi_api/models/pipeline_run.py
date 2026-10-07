@@ -142,6 +142,7 @@ class FacodiPipelineRun(models.Model):
             }
             self.write(vals)
             self._sync_to_project_task()
+            return True
         except Exception as e:
             _logger.exception("Pipeline execution failed for run %s", self.id)
             self.write({
@@ -150,6 +151,7 @@ class FacodiPipelineRun(models.Model):
             })
             if self.task_id:
                 self.task_id.message_post(body="Falha na execução do pipeline.")
+            return False
 
     def _sync_to_project_task(self):
         """Create or update a mirrored task in project.project / project.task."""

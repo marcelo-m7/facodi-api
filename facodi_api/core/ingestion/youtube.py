@@ -30,11 +30,13 @@ class YouTubeIngestionAdapter:
 
     def ingest(self, source):
         video_id = self.extract_video_id(source.url or '')
+        if not video_id:
+            raise ValueError('Invalid YouTube URL')
         segments, warnings = [], []
         language = source.language or 'pt'
         duration = None
         metadata = dict(source.metadata)
-        if source.raw_content and (metadata.get('is_manual_transcript') or not video_id):
+        if source.raw_content and metadata.get('is_manual_transcript'):
             text = source.raw_content.strip()
             timed = []
             for line in text.splitlines():

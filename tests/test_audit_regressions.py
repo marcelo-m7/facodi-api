@@ -130,3 +130,32 @@ def test_odoo_entrypoints_compile():
     from pathlib import Path
     for path in Path('facodi_api').rglob('*.py'):
         ast.parse(path.read_text(), filename=str(path))
+
+def test_replay_same_catalog_at_a_different_time(tmp_path):
+    runner = PipelineRunner(storage_dir=str(tmp_path))
+    first = CatalogSnapshot(snapshot_id='stable', created_at='2026-10-07T00:00:00Z', targets=[])
+    later = CatalogSnapshot(snapshot_id='stable', created_at='2026-10-07T00:01:00Z', targets=[])
+    run = runner.run_pipeline(source(), catalog=first, idempotency_key='stable-catalog')
+    assert runner.run_pipeline(source(), catalog=later, idempotency_key='stable-catalog').run_id == run.run_id
+
+
+def test_legacy_artifact_blocks_reprocessing_until_migration(tmp_path):
+    runner = PipelineRunner(storage_dir=str(tmp_path))
+    run = runner.run_pipeline(source(), idempotency_key='legacy-key')
+    artifact = run.to_dict()
+    artifact['run_id'] = 'legacy-key'
+    artifact['metadata'].pop('input_fingerprint')
+    (tmp_path / (run.run_id + '.json')).unlink()
+    legacy_file = tmp_path / 'legacy-key.json'
+    legacy_file.write_text(json.dumps(artifact))
+    with pytest.raises(ValueError, match='Legacy'):
+        runner.run_pipeline(source(), idempotency_key='legacy-key')
+    assert json.loads(legacy_file.read_text())['run_id'] == 'legacy-key'
+    assert not (tmp_path / (run.run_id + '.json')).exists()
+
+
+def test_manual_transcript_cannot_bypass_youtube_url_validation():
+    with pytest.raises(ValueError, match='YouTube URL'):
+        YouTubeIngestionAdapter().ingest(ContentSource(source_type=SourceType.YOUTUBE,
+            url='https://evil.test/video', raw_content='manual content',
+            metadata={'is_manual_transcript': True}))

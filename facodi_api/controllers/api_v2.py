@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 import os
 import uuid
 
 from odoo import http
 from odoo.http import request
-from werkzeug.exceptions import BadRequest, Forbidden, NotFound, ServiceUnavailable, NotImplemented
+from werkzeug.exceptions import BadRequest, Forbidden, NotFound, ServiceUnavailable, NotImplemented, RequestEntityTooLarge, UnsupportedMediaType
 from werkzeug.wrappers import Response
+
+from ..core.contracts.http_input import read_json_object, PayloadTooLarge, InvalidPayload
 
 _logger = logging.getLogger(__name__)
 
@@ -34,11 +37,16 @@ class FacodiApiV2Controller(http.Controller):
     def create_pipeline_run(self, **kwargs):
         """Submit a content item for ingestion and processing. Responds 202 Accepted asynchronously."""
         self._check_auth()
+        if not request.httprequest.is_json:
+            raise UnsupportedMediaType("Content-Type must be application/json")
         if request.httprequest.content_length and request.httprequest.content_length > 262144:
-            raise BadRequest("Payload too large")
-        data = request.get_json_data(silent=False)
-        if not isinstance(data, dict):
-            raise BadRequest("Expected a JSON object")
+            raise RequestEntityTooLarge("Payload too large")
+        try:
+            data = read_json_object(request.httprequest.stream)
+        except PayloadTooLarge:
+            raise RequestEntityTooLarge("Payload too large") from None
+        except InvalidPayload:
+            raise BadRequest("Invalid JSON body") from None
         if data.get("sync"):
             raise BadRequest("Synchronous execution is disabled")
         idempotency_key = (
@@ -48,7 +56,7 @@ class FacodiApiV2Controller(http.Controller):
 
         if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 128:
             raise BadRequest("Idempotency-Key is required (1–128 characters)")
-        fingerprint = __import__("hashlib").sha256(json.dumps(data, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        fingerprint = hashlib.sha256(json.dumps(data, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
         source_type = data.get("source_type", "document")
         url = data.get("url")

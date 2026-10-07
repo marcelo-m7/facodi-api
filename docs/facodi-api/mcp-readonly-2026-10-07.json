@@ -1,0 +1,172 @@
+{
+  "checked_at_utc": "2026-10-07T06:33:56.577Z",
+  "target": "https://facodi.com",
+  "database": "facodi",
+  "mode": "read_only",
+  "mutations": 0,
+  "checks": {
+    "module": {
+      "records": [
+        {
+          "id": 731,
+          "name": "facodi_api",
+          "state": "installed",
+          "latest_version": "19.0.1.0.0",
+          "installed_version": "19.0.1.0.0"
+        }
+      ],
+      "total": 1,
+      "limit": 5,
+      "offset": 0,
+      "model": "ir.module.module"
+    },
+    "cron": {
+      "records": [
+        {
+          "id": 26,
+          "name": "FACODI: Process Received Pipeline Runs",
+          "active": true,
+          "code": "model.cron_process_received_runs()",
+          "nextcall": "2026-10-07T06:34:30+00:00",
+          "lastcall": "2026-10-07T06:30:26+00:00"
+        }
+      ],
+      "total": 1,
+      "limit": 10,
+      "offset": 0,
+      "model": "ir.cron"
+    },
+    "runs": {
+      "records": [
+        {
+          "id": 3,
+          "run_id": "ff021633-7fc9-4d51-b590-ba17c040560e",
+          "idempotency_key": "facodi-course-gestao-01",
+          "name": "Gestão Financeira para Pequenas Empresas",
+          "status": "published",
+          "task_id": [
+            6,
+            "Conteúdo: Gestão Financeira para Pequenas Empresas"
+          ],
+          "project_id": [
+            2,
+            "FACODI Ingestão & Conteúdos"
+          ],
+          "concepts_count": 12,
+          "chunks_count": 1,
+          "create_date": "2026-10-07T06:27:21+00:00"
+        },
+        {
+          "id": 2,
+          "run_id": "run-direct-uuid",
+          "idempotency_key": false,
+          "name": "Direct Test Run",
+          "status": "waiting_review",
+          "task_id": [
+            5,
+            "Conteúdo: Direct Test"
+          ],
+          "project_id": [
+            2,
+            "FACODI Ingestão & Conteúdos"
+          ],
+          "concepts_count": 1,
+          "chunks_count": 1,
+          "create_date": "2026-10-07T06:24:25+00:00"
+        },
+        {
+          "id": 1,
+          "run_id": "test-xmlrpc-01",
+          "idempotency_key": "test-xmlrpc-01",
+          "name": "Test Run XMLRPC",
+          "status": "published",
+          "task_id": [
+            4,
+            "Conteúdo: Teste via ORM"
+          ],
+          "project_id": [
+            2,
+            "FACODI Ingestão & Conteúdos"
+          ],
+          "concepts_count": 2,
+          "chunks_count": 1,
+          "create_date": "2026-10-07T06:19:58+00:00"
+        }
+      ],
+      "total": 3,
+      "limit": 10,
+      "offset": 0,
+      "model": "facodi.pipeline.run"
+    },
+    "publication_title_lookup": {
+      "records": [],
+      "total": 0,
+      "limit": 20,
+      "offset": 0,
+      "model": "slide.slide"
+    },
+    "tasks": {
+      "records": [
+        {
+          "id": 6,
+          "name": "Conteúdo: Gestão Financeira para Pequenas Empresas",
+          "project_id": [
+            2,
+            "FACODI Ingestão & Conteúdos"
+          ],
+          "parent_id": false,
+          "child_ids": []
+        },
+        {
+          "id": 5,
+          "name": "Conteúdo: Direct Test",
+          "project_id": [
+            2,
+            "FACODI Ingestão & Conteúdos"
+          ],
+          "parent_id": false,
+          "child_ids": []
+        },
+        {
+          "id": 4,
+          "name": "Conteúdo: Teste via ORM",
+          "project_id": [
+            2,
+            "FACODI Ingestão & Conteúdos"
+          ],
+          "parent_id": false,
+          "child_ids": []
+        }
+      ],
+      "total": 3,
+      "limit": 10,
+      "offset": 0,
+      "model": "project.task"
+    },
+    "project": {
+      "records": [
+        {
+          "id": 2,
+          "name": "FACODI Ingestão & Conteúdos",
+          "privacy_visibility": "portal"
+        }
+      ],
+      "total": 1,
+      "limit": 1,
+      "offset": 0,
+      "model": "project.project"
+    },
+    "gate": {
+      "records": [],
+      "total": 0,
+      "limit": 1,
+      "offset": 0,
+      "model": "ir.config_parameter"
+    }
+  },
+  "limitations": [
+    "Module version does not identify deployed git SHA",
+    "Exact-title lookup is not an exhaustive publication inventory",
+    "No HTTP auth, writes, queue execution, approval, restart or E2E mutation executed"
+  ]
+}
