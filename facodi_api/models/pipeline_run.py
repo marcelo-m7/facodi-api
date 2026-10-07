@@ -384,7 +384,11 @@ class FacodiPipelineRun(models.Model):
         }
         if self.source_type == "youtube":
             slide_values.update({"slide_category": "video", "source_type": "external", "video_url": self.source_url})
-        slide = self.env["slide.slide"].create(slide_values)
+        # This receipt is owned by v2. Suppress the legacy learning video
+        # export hook for this creation only; this context grants no access.
+        slide = self.env["slide.slide"].with_context(
+            facodi_supabase_video_sync=True,
+        ).create(slide_values)
         if not slide.exists() or slide.channel_id != channel or not slide.is_published:
             raise UserError("Canonical content was not persisted in the target course.")
 
