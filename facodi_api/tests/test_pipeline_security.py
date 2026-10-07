@@ -261,3 +261,27 @@ class TestPipelineSecurity(TransactionCase):
         courses[0].name = 'Renamed after acceptance'
         self.assertTrue(run.action_execute_pipeline())
         self.assertEqual(run.catalog_snapshot_json, accepted)
+
+    def test_backend_command_captures_revision_and_rejects_stale_confirmation(self):
+        from odoo.addons.facodi_api.core.contracts.lifecycle import RevisionConflict
+        run = self.Run.create(self.values('backend-cancel'))
+        action = run.action_open_cancel()
+        wizard = self.env[action['res_model']].with_user(self.operator).browse(action['res_id'])
+        self.assertEqual(wizard.expected_revision, run.revision)
+        run._set_execution_values({'status': 'waiting_review'})
+        with self.assertRaises(RevisionConflict):
+            wizard.action_apply()
+        self.assertEqual(run.status, 'waiting_review')
+
+    def test_backend_command_cannot_forge_scope_or_revision(self):
+        run = self.Run.create(self.values('backend-guard'))
+        self.assertIn('facodi.pipeline.command', self.env)
+        CommandWizard = self.env['facodi.pipeline.command'].with_user(self.operator)
+        with self.assertRaises(AccessError):
+            CommandWizard.create({'run_id': run.id, 'command': 'cancel', 'expected_revision': 999})
+        wizard = CommandWizard.with_context(default_expected_revision=999).create({'run_id': run.id, 'command': 'cancel'})
+        self.assertEqual(wizard.expected_revision, 0)
+        wizard.action_apply()
+        wizard.action_apply()
+        self.assertEqual(run.status, 'cancelled')
+        self.assertEqual(run.revision, 1)
