@@ -48,3 +48,38 @@ def test_hard_deadline_terminates_a_stalled_real_child(tmp_path, monkeypatch):
         youtube.acquire_transcript('dQw4w9WgXcQ', 'en', budget_seconds=0.2)
     assert error.value.code == 'YOUTUBE_TIMEOUT'
     assert time.monotonic() - started < 2
+
+
+def test_redirect_body_is_rejected_before_requests_consumes_it():
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from facodi_api.core.ingestion.youtube_transport import BoundedTranscriptSession, YouTubeAcquisitionError
+    release = threading.Event()
+
+    class Redirect(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header('Location', '/next')
+            self.send_header('Content-Length', '100000000')
+            self.end_headers()
+            self.wfile.flush()
+            release.wait(2)  # A reader of the redirect body would block here.
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(('127.0.0.1', 0), Redirect)
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        with BoundedTranscriptSession() as session:
+            with pytest.raises(YouTubeAcquisitionError) as error:
+                session.get('http://127.0.0.1:%s/' % server.server_port)
+        assert error.value.code == 'YOUTUBE_REDIRECT_REJECTED'
+        assert time.monotonic() - started < 1
+    finally:
+        release.set()
+        thread.join(3)
+        server.server_close()

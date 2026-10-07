@@ -2,8 +2,15 @@ import os
 import unittest
 from unittest import mock
 
-from facodi_api.provider.registry import get_provider, list_providers
-from facodi_api.service import FacodiApiService
+if __package__:
+    from ..provider.registry import get_provider, list_providers
+    from ..service import FacodiApiService
+else:
+    from facodi_api.provider.registry import get_provider, list_providers
+    from facodi_api.service import FacodiApiService
+
+
+ROOT_MODULE = __package__.rsplit(".tests", 1)[0] if __package__ else "facodi_api"
 
 
 class FakeResponse:
@@ -30,7 +37,7 @@ class ProviderContractTest(unittest.TestCase):
             os.environ,
             {"SUPABASE_URL": "https://example.supabase.co", "SUPABASE_SECRET_KEY": "secret-key"},
             clear=False,
-        ), mock.patch("facodi_api.provider.supabase.requests.post", return_value=FakeResponse({"ok": True})) as request_mock:
+        ), mock.patch(ROOT_MODULE + ".provider.supabase.requests.post", return_value=FakeResponse({"ok": True})) as request_mock:
             result = FacodiApiService.dispatch(
                 "supabase",
                 "video.ingest",
@@ -49,7 +56,7 @@ class ProviderContractTest(unittest.TestCase):
             os.environ,
             {"SUPABASE_URL": "https://example.supabase.co", "SUPABASE_SECRET_KEY": "secret-key"},
             clear=False,
-        ), mock.patch("facodi_api.provider.supabase.requests.post", return_value=FakeResponse({"status": "ok"})) as request_mock:
+        ), mock.patch(ROOT_MODULE + ".provider.supabase.requests.post", return_value=FakeResponse({"status": "ok"})) as request_mock:
             FacodiApiService.analyze_resource({"source_url": "https://example.com/resource"})
             FacodiApiService.discover_metadata({"source_url": "https://example.com/resource"})
 
@@ -71,7 +78,7 @@ class ProviderContractTest(unittest.TestCase):
                 "ABACATE_PAY_BASE_URL": "https://api.abacatepay.com",
             },
             clear=False,
-        ), mock.patch("facodi_api.provider.abacate.requests.post", return_value=FakeResponse({"id": "pay_123", "status": "open"})) as request_mock:
+        ), mock.patch(ROOT_MODULE + ".provider.abacate.requests.post", return_value=FakeResponse({"id": "pay_123", "status": "open"})) as request_mock:
             result = FacodiApiService.dispatch(
                 "abacate",
                 "checkout.session.create",

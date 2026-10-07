@@ -16,7 +16,7 @@ Entrega de origem: API PR #16 (`9b8c942`) e deploy PR #261 (`4de0b75`). O relat�
 
 ## Validação e limitações
 
-Testes puros locais: 56 passed, 1 skipped (suite ORM exige Odoo real). Deploy: 50 contratos passam; execução Docker ocorrerá no CI porque este ambiente não tem daemon Docker.
+Testes puros locais: 57 passed, 1 skipped (suite ORM exige Odoo real). Deploy: 50 contratos passam; execução Docker ocorrerá no CI porque este ambiente não tem daemon Docker.
 
 O CI de API runtime verifica instalação com testes ORM, upgrades, gate HTTP fechado, HTTP 202, limites, keep-alive, idempotência concorrente, isolamento de papéis, lock com dois cursores, scheduler real, publicação e persistência após restart. O CI principal verifica a imagem de produção e os fluxos atuais da plataforma.
 

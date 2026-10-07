@@ -127,7 +127,7 @@ class FacodiPipelineRun(models.Model):
         if vals["source_type"] not in {"youtube", "manual", "markdown", "document"}:
             raise ValidationError("Unsupported source type.")
         key = vals.get("idempotency_key")
-        if not isinstance(key, str) or not 1 <= len(key) <= 128:
+        if not isinstance(key, str) or not 1 <= len(key) <= 128 or any(ord(char) < 32 or ord(char) == 127 for char in key):
             raise ValidationError("Idempotency key is required (1–128 characters).")
         manual = vals.get("is_manual_transcript", False)
         if not isinstance(manual, bool):

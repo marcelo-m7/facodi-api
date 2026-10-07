@@ -16,11 +16,20 @@ class BoundedTranscriptSession(requests.Session):
         super().__init__()
         self.deadline = time.monotonic() + budget_seconds
 
+    @staticmethod
+    def _reject_redirect(response, **kwargs):
+        # Runs before Requests prepares _next (which otherwise consumes redirect bodies).
+        if 300 <= response.status_code < 400:
+            response.close()
+            raise YouTubeAcquisitionError("YOUTUBE_REDIRECT_REJECTED")
+        return response
+
     def request(self, method, url, **kwargs):
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise YouTubeAcquisitionError("YOUTUBE_TIMEOUT")
         kwargs["timeout"] = (min(5, remaining), min(10, remaining))
+        kwargs["hooks"] = {"response": [self._reject_redirect]}
         kwargs["allow_redirects"] = False
         kwargs["stream"] = True
         response = super().request(method, url, **kwargs)

@@ -83,7 +83,7 @@ class FacodiApiV2Controller(http.Controller):
         lock_key = f"facodi-pipeline:{request.env.company.id}:{request.env.user.id}:{idempotency_key}"
         lock_cursor = request.env.registry.cursor()
         try:
-            lock_cursor.execute("SET lock_timeout = '10s'")
+            lock_cursor.execute("SET LOCAL lock_timeout = '10s'")
             lock_cursor.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))", [lock_key])
             lock_cursor.commit()
         except Exception:
