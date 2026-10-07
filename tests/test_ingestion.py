@@ -53,5 +53,5 @@ def test_youtube_manual_transcript_fallback():
     assert len(doc.segments) == 3
     assert doc.segments[0].start == 0.0
     assert "Never gonna give you up" in doc.segments[0].text
-    assert doc.duration_seconds is not None
-    assert doc.duration_seconds >= 12.0
+    assert doc.duration_seconds is None
+    assert doc.segments[-1].duration == 0.0

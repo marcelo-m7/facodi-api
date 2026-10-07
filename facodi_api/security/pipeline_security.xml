@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="group_pipeline_operator" model="res.groups">
+        <field name="name">FACODI Pipeline Operator</field>
+        <field name="implied_ids" eval="[(4, ref('project.group_project_user'))]"/>
+    </record>
+    <record id="group_pipeline_reviewer" model="res.groups">
+        <field name="name">FACODI Pipeline Reviewer</field>
+        <field name="implied_ids" eval="[(4, ref('facodi_api.group_pipeline_operator')), (4, ref('website_slides.group_website_slides_manager')), (4, ref('project.group_project_manager'))]"/>
+    </record>
+    <record id="rule_pipeline_run_operator" model="ir.rule">
+        <field name="name">Pipeline runs: owner and allowed companies</field>
+        <field name="model_id" ref="model_facodi_pipeline_run"/>
+        <field name="domain_force">[('owner_id', '=', user.id), ('company_id', 'in', company_ids)]</field>
+        <field name="groups" eval="[(4, ref('facodi_api.group_pipeline_operator'))]"/>
+    </record>
+    <record id="rule_pipeline_run_reviewer" model="ir.rule">
+        <field name="name">Pipeline runs: reviewers in allowed companies</field>
+        <field name="model_id" ref="model_facodi_pipeline_run"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+        <field name="groups" eval="[(4, ref('facodi_api.group_pipeline_reviewer'))]"/>
+    </record>
+</odoo>

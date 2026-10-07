@@ -1,9 +1,4 @@
-try:
-    from . import controllers
-    from . import models
-except ModuleNotFoundError as e:
-    # Allow importing standalone core / CLI when odoo is not in python environment
-    if e.name != "odoo" and not (e.name and e.name.startswith("odoo.")):
-        raise
-    controllers = None
-    models = None
+"""Load Odoo integration only when Odoo is installed; expose real import errors."""
+import importlib.util
+if importlib.util.find_spec("odoo") is not None:
+    from . import controllers, models

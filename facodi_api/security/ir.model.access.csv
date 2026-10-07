@@ -1,4 +1,4 @@
 id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
 access_facodi_api_event,facodi.api.event,model_facodi_api_event,base.group_system,1,1,1,1
-access_facodi_pipeline_run,facodi.pipeline.run,model_facodi_pipeline_run,base.group_user,1,1,1,1
-access_facodi_pipeline_run_manager,facodi.pipeline.run,model_facodi_pipeline_run,base.group_system,1,1,1,1
+access_facodi_pipeline_run_operator,facodi.pipeline.run,model_facodi_pipeline_run,facodi_api.group_pipeline_operator,1,1,1,0
+access_facodi_pipeline_run_reviewer,facodi.pipeline.run,model_facodi_pipeline_run,facodi_api.group_pipeline_reviewer,1,1,1,0

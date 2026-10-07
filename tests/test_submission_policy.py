@@ -1,0 +1,85 @@
+import io
+import socket
+
+import pytest
+
+from facodi_api.core.contracts import http_input
+from facodi_api.core.contracts.dtos import ContentSource, SourceType
+from facodi_api.core.ingestion.document import DocumentIngestionAdapter
+
+
+@pytest.mark.parametrize('kind', [SourceType.MANUAL, SourceType.MARKDOWN])
+def test_blank_text_never_becomes_reviewable_content(kind):
+    with pytest.raises(ValueError):
+        DocumentIngestionAdapter().ingest(ContentSource(kind, raw_content=' \n\t '))
+
+
+def test_known_length_does_not_wait_for_socket_eof():
+    reader, writer = socket.socketpair()
+    reader.settimeout(0.2)
+    body = b'{"title":"small request"}'
+    try:
+        writer.sendall(body)
+        with reader.makefile('rb') as stream:
+            assert http_input.read_request_object(stream, len(body)) == {'title': 'small request'}
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_terminated_stream_remains_bounded():
+    with pytest.raises(http_input.PayloadTooLarge):
+        http_input.read_request_object(io.BytesIO(b'x' * 262145), None, terminated=True)
+
+
+def test_unterminated_body_without_length_is_rejected():
+    with pytest.raises(http_input.InvalidPayload):
+        http_input.read_request_object(io.BytesIO(b'{}'), None)
+
+
+def test_hard_deadline_terminates_a_stalled_real_child(tmp_path, monkeypatch):
+    import time
+    from facodi_api.core.ingestion import youtube
+    worker = tmp_path / 'stalled_transport.py'
+    worker.write_text('import time\ntime.sleep(60)\n')
+    monkeypatch.setattr(youtube, '_WORKER_SCRIPT', worker)
+    started = time.monotonic()
+    with pytest.raises(youtube.YouTubeAcquisitionError) as error:
+        youtube.acquire_transcript('dQw4w9WgXcQ', 'en', budget_seconds=0.2)
+    assert error.value.code == 'YOUTUBE_TIMEOUT'
+    assert time.monotonic() - started < 2
+
+
+def test_redirect_body_is_rejected_before_requests_consumes_it():
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from facodi_api.core.ingestion.youtube_transport import BoundedTranscriptSession, YouTubeAcquisitionError
+    release = threading.Event()
+
+    class Redirect(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header('Location', '/next')
+            self.send_header('Content-Length', '100000000')
+            self.end_headers()
+            self.wfile.flush()
+            release.wait(2)  # A reader of the redirect body would block here.
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(('127.0.0.1', 0), Redirect)
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        with BoundedTranscriptSession() as session:
+            with pytest.raises(YouTubeAcquisitionError) as error:
+                session.get('http://127.0.0.1:%s/' % server.server_port)
+        assert error.value.code == 'YOUTUBE_REDIRECT_REJECTED'
+        assert time.monotonic() - started < 1
+    finally:
+        release.set()
+        thread.join(3)
+        server.server_close()
