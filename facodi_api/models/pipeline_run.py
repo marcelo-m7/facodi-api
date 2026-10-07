@@ -406,14 +406,18 @@ class FacodiPipelineRun(models.Model):
         }
         if self.source_type == "youtube":
             slide_values.update({"slide_category": "video", "source_type": "external", "video_url": self.source_url})
+        publication_context = {
+            key: value for key, value in self.env.context.items()
+            if not key.startswith("default_")
+        }
         with self.env.cr.savepoint():
             # This receipt is owned by v2. Suppress the legacy learning video
             # export hook for this creation only; this context grants no access.
             slide = self.env["slide.slide"].with_context(
-                facodi_supabase_video_sync=True,
+                publication_context, facodi_supabase_video_sync=True,
             ).create(slide_values)
             if native_review_values is not None:
-                review = self.env["facodi.learning.content.review"].create({
+                review = self.env["facodi.learning.content.review"].with_context(publication_context).create({
                     **native_review_values, "slide_id": slide.id,
                 })
                 review.action_approve()
