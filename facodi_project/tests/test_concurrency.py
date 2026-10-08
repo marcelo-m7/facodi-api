@@ -5,6 +5,7 @@ import socket
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from time import monotonic
 from uuid import uuid4
 
 from odoo.tools import config
@@ -66,13 +67,21 @@ def run_concurrency(env):
     settings.update(database=env.cr.dbname, project_id=project.id, key=key)
 
     def compete(expected_count):
+        started = monotonic()
+        deadline = started + 60
+
+        def remaining():
+            available = deadline - monotonic()
+            if available <= 0:
+                raise TimeoutError("Standalone race exceeded its 60-second deadline")
+            return available
+
         processes = []
         connections = []
         with TemporaryDirectory(prefix="facodi-project-race-") as directory:
             settings.update(socket=str(Path(directory) / "barrier.sock"), expected_count=expected_count)
             worker_environment = dict(os.environ, FACODI_RACE_SETTINGS=json.dumps(settings))
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-                listener.settimeout(60)
                 listener.bind(settings["socket"])
                 listener.listen(2)
                 try:
@@ -82,25 +91,26 @@ def run_concurrency(env):
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                         ))
                     for worker_number in range(2):
+                        listener.settimeout(remaining())
                         connection, address = listener.accept()
-                        connection.settimeout(40)
+                        connection.settimeout(remaining())
                         assert connection.recv(5) == b"ready"
                         connections.append(connection)
                     for connection in connections:
                         connection.sendall(b"go")
                     results = []
                     for process in processes:
-                        output, errors = process.communicate(timeout=90)
+                        output, errors = process.communicate(timeout=remaining())
                         if process.returncode:
                             raise AssertionError("Standalone worker failed: %s" % errors[-3000:])
                         results.append(json.loads(output.strip().splitlines()[-1]))
-                    return results
-                except TimeoutError as error:
+                    return results, started, [process.returncode for process in processes]
+                except (TimeoutError, subprocess.TimeoutExpired) as error:
                     for process in processes:
                         if process.poll() is not None:
                             output, errors = process.communicate()
                             raise AssertionError("Worker startup failed: %s" % errors[-3000:]) from error
-                    raise
+                    raise AssertionError("Standalone race timeout within 60 seconds") from error
                 finally:
                     for connection in connections:
                         connection.close()
@@ -109,23 +119,41 @@ def run_concurrency(env):
                             process.kill()
                         process.wait(timeout=10)
 
-    initial = compete(0)
-    assert initial[0]["id"] == initial[1]["id"]
-    assert initial[0]["facodi_ref"] == initial[1]["facodi_ref"]
-    assert max(result["attempts"] for result in initial) >= 2
-    env.cr.rollback()
-    env.invalidate_all()
-    tasks = env["project.task"].with_context(active_test=False).search([
-        ("project_id", "=", project.id), ("facodi_idempotency_key", "=", key),
-    ])
-    assert len(tasks) == 1 and not tasks.child_ids
-    assert tasks.facodi_external_ref == "stable-external-job"
+    def record_race(number, case, results, started, exit_codes):
+        env.cr.execute("SELECT count(*) FROM project_task WHERE project_id=%s "
+                       "AND facodi_idempotency_key=%s", [project.id, settings["key"]])
+        sql_count = env.cr.fetchone()[0]
+        elapsed = monotonic() - started
+        assert sql_count == 1 and elapsed <= 60
+        print(json.dumps({
+            "race": number, "case": case, "exit_codes": exit_codes,
+            "task_ids": [result["id"] for result in results],
+            "attempts": [result["attempts"] for result in results],
+            "sql_count": sql_count, "seconds": round(elapsed, 3), "result": "PASS",
+        }), flush=True)
+
+    for race_number in range(1, 21):
+        key = "race-%s" % uuid4()
+        settings["key"] = key
+        env.cr.commit()
+        initial, started, exit_codes = compete(0)
+        assert initial[0]["id"] == initial[1]["id"]
+        assert initial[0]["facodi_ref"] == initial[1]["facodi_ref"]
+        assert max(result["attempts"] for result in initial) >= 2
+        env.cr.rollback()
+        env.invalidate_all()
+        tasks = env["project.task"].with_context(active_test=False).search([
+            ("project_id", "=", project.id), ("facodi_idempotency_key", "=", key),
+        ])
+        assert len(tasks) == 1 and not tasks.child_ids
+        assert tasks.facodi_external_ref == "stable-external-job"
+        record_race(race_number, "create", initial, started, exit_codes)
     env.cr.execute("SELECT conname FROM pg_constraint WHERE conrelid='project_task'::regclass "
                    "AND conname IN ('project_task_facodi_ref_unique', 'project_task_facodi_replay_unique')")
     assert len(env.cr.fetchall()) == 2
     tasks.write({"name": "Human archived execution", "active": False})
     env.cr.commit()
-    replay = compete(1)
+    replay, started, exit_codes = compete(1)
     assert all(result["id"] == initial[0]["id"] and not result["active"] for result in replay)
     env.cr.rollback()
     env.invalidate_all()
@@ -134,4 +162,14 @@ def run_concurrency(env):
     assert env["project.task"].with_context(active_test=False).search_count([
         ("project_id", "=", project.id), ("facodi_idempotency_key", "=", key),
     ]) == 1
-    print("PASS standalone two-process race, PostgreSQL uniqueness, transactional retry, receipt and archived replay")
+    record_race(21, "archived-replay", replay, started, exit_codes)
+    other_project = env["project.project"].create({
+        "name": "Second authorized race workspace", "facodi_managed": True,
+        "privacy_visibility": "followers",
+    })
+    other = env["project.task"].facodi_ensure_task(other_project.id, "Different workspace", key)
+    assert other["id"] != tasks.id and other["facodi_ref"] != tasks.facodi_ref
+    env.cr.commit()
+    print("PASS same key in different authorized Projects creates different tasks")
+    print("PASS 20 independent two-process races within 60 seconds each, PostgreSQL uniqueness, "
+          "transactional retry, receipt and archived replay")
