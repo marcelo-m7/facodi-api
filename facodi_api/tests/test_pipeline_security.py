@@ -106,8 +106,69 @@ class TestPipelineSecurity(TransactionCase):
         with self.assertRaises(AccessError):
             run.with_context(facodi_pipeline_internal=True).write({'execution_plane': 'odoo_python'})
         with self.assertRaises(UserError):
-            run.action_cancel(expected_revision=run.revision)
+            run.action_retry(expected_revision=run.revision)
         self.assertEqual(run.status, 'received')
+
+    def test_canonical_cancel_accepts_one_intent_without_network_and_dispatches_afterwards(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-cancel'))
+        expected = run.revision
+        with patch.object(type(self.Run), '_call_canonical_boundary', side_effect=AssertionError('No network before commit')):
+            self.assertTrue(run.action_cancel(expected_revision=expected))
+            intent = run.canonical_command_json
+            self.assertTrue(run.action_cancel(expected_revision=expected))
+            self.assertEqual(run.canonical_command_json, intent)
+        self.assertEqual(run.status, 'cancelled')
+        self.assertFalse(run.canonical_job_id)
+        command = json.loads(intent)
+        accepted = self.canonical_receipt(run)
+        cancelled = dict(accepted, revision=2, status='cancelled', result={'error_code': 'CANCELLED_BY_OPERATOR'})
+        calls = []
+
+        def boundary(record, payload):
+            calls.append(payload)
+            if payload['action'] == 'submit':
+                return accepted
+            return {'receipt': cancelled, 'command_id': command['command_id'], 'command_revision': 1}
+
+        with patch.object(type(self.Run), '_call_canonical_boundary', boundary):
+            self.assertTrue(self.Run._dispatch_canonical_receipts())
+            self.assertFalse(self.Run._dispatch_canonical_receipts())
+        self.assertEqual([payload['action'] for payload in calls], ['submit', 'cancel'])
+        self.assertEqual(calls[1]['expected_revision'], 0)
+        self.assertEqual(run.canonical_command_revision, 1)
+        self.assertFalse(run.canonical_command_json)
+        self.assertEqual(run.task_id.facodi_external_ref, accepted['job_id'])
+        self.assertFalse(run.metadata_json)
+        self.assertTrue(run.action_cancel(expected_revision=expected))
+        self.assertFalse(run.canonical_command_json)
+
+    def test_canonical_cancel_running_work_without_changing_legacy_command_policy(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-cancel-running'))
+        running = self.canonical_receipt(run, status='processing', revision=2, attempt=1)
+        run._apply_canonical_receipt(running)
+        self.assertEqual(run.status, 'running')
+        self.assertTrue(run.action_cancel(expected_revision=run.revision))
+        self.assertEqual(run.status, 'cancelled')
+        self.assertEqual(json.loads(run.history_json)[-1]['from'], 'running')
+        self.assertTrue(run.canonical_command_json)
+
+    def test_canonical_cancel_rejects_wrong_ack_and_preserves_pending_intent(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-cancel-wrong-ack'))
+        accepted = self.canonical_receipt(run)
+        run._apply_canonical_receipt(accepted)
+        run.action_cancel(expected_revision=run.revision)
+        pending = run.canonical_command_json
+        with patch.object(type(self.Run), '_call_canonical_boundary', return_value={
+                'receipt': dict(accepted, status='cancelled', revision=2),
+                'command_id': str(uuid4()), 'command_revision': 1}):
+            with self.assertRaises(ValidationError):
+                self.Run._dispatch_canonical_receipts()
+        self.assertEqual(run.canonical_command_json, pending)
+        self.assertEqual(run.canonical_receipt_revision, 1)
+        self.assertEqual(run.status, 'cancelled')
 
     def test_canonical_intake_and_task_roll_back_together(self):
         self.canonical_workspace()

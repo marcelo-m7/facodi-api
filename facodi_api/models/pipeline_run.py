@@ -110,6 +110,8 @@ class FacodiPipelineRun(models.Model):
     canonical_receipt_revision = fields.Integer(readonly=True, default=0, copy=False)
     canonical_receipt_json = fields.Text(readonly=True, copy=False)
     canonical_polled_at = fields.Datetime(readonly=True, copy=False)
+    canonical_command_json = fields.Text(readonly=True, copy=False)
+    canonical_command_revision = fields.Integer(readonly=True, default=0, copy=False)
     target_channel_id = fields.Many2one("slide.channel", string="Publication Course", index=True, ondelete="restrict")
     published_slide_id = fields.Many2one("slide.slide", string="Published Content", readonly=True, copy=False, ondelete="restrict")
     reviewed_by_id = fields.Many2one("res.users", string="Reviewed By", readonly=True, copy=False)
@@ -519,6 +521,10 @@ class FacodiPipelineRun(models.Model):
                     parts.append(part)
                 try:
                     result = json.loads(b''.join(parts), parse_constant=lambda value: (_ for _ in ()).throw(ValueError()))
+                    if payload['action'] == 'cancel':
+                        if not isinstance(result, dict) or not isinstance(result['receipt'], dict):
+                            raise ValueError()
+                        return result
                     return result['receipt']
                 except (KeyError, TypeError, ValueError):
                     raise UserError('INVALID_CANONICAL_RECEIPT') from None
@@ -538,7 +544,7 @@ class FacodiPipelineRun(models.Model):
             if (receipt['task_ref'] != self.task_id.facodi_ref or receipt['company_id'] != self.company_id.id
                     or receipt['cohort'] != 'p2' or type(receipt['revision']) is not int or receipt['revision'] <= 0
                     or type(receipt['attempt']) is not int or not 0 <= receipt['attempt'] <= 2147483647
-                    or receipt['status'] not in {'queued', 'processing', 'needs_review', 'failed'}
+                    or receipt['status'] not in {'queued', 'processing', 'needs_review', 'failed', 'cancelled'}
                     or not isinstance(receipt['result'], dict)):
                 raise ValueError()
             encoded = json.dumps(receipt, sort_keys=True, ensure_ascii=False, allow_nan=False)
@@ -555,10 +561,17 @@ class FacodiPipelineRun(models.Model):
             if encoded != saved:
                 raise ValidationError('CANONICAL_REVISION_CONFLICT')
             return False
-        if self.status not in {'received', 'running'}:
+        cancelling = self.status == 'cancelled' and bool(self.canonical_command_json)
+        if self.status not in {'received', 'running'} and not cancelling:
             raise ValidationError('CANONICAL_TERMINAL_CONFLICT')
         values = {'canonical_job_id': job_id, 'canonical_receipt_revision': receipt['revision'],
                   'canonical_receipt_json': encoded, 'attempt_count': receipt['attempt']}
+        if receipt['status'] == 'cancelled' and not cancelling:
+            raise ValidationError('CANONICAL_COMMAND_CONFLICT')
+        if cancelling:
+            self.task_id.facodi_bind_receipt(job_id)
+            self._set_execution_values(values)
+            return True
         if receipt['status'] == 'needs_review':
             result = receipt['result']
             source, enriched = result.get('document_data', {}), result.get('enriched_data', {})
@@ -619,9 +632,10 @@ class FacodiPipelineRun(models.Model):
 
     @api.model
     def _dispatch_canonical_receipts(self):
-        self.flush_model(['execution_plane', 'status', 'canonical_polled_at'])
+        self.flush_model(['execution_plane', 'status', 'canonical_polled_at', 'canonical_command_json'])
         self.env.cr.execute("""SELECT id FROM facodi_pipeline_run
-            WHERE execution_plane = 'supabase' AND status IN ('received', 'running')
+            WHERE execution_plane = 'supabase' AND
+                (status IN ('received', 'running') OR canonical_command_json IS NOT NULL)
             ORDER BY canonical_polled_at NULLS FIRST, id LIMIT 1 FOR UPDATE SKIP LOCKED""")
         row = self.env.cr.fetchone()
         if not row:
@@ -631,6 +645,23 @@ class FacodiPipelineRun(models.Model):
         run.check_access('write')
         run._authorize_channel(run.target_channel_id, run.company_id, run.website_id)
         payload = {'task_ref': run.task_id.facodi_ref, 'company_id': run.company_id.id, 'cohort': 'p2'}
+        if run.canonical_command_json:
+            command = json.loads(run.canonical_command_json)
+            if not run.canonical_job_id:
+                run._apply_canonical_receipt(run._call_canonical_boundary(dict(
+                    payload, action='submit', request=json.loads(run.canonical_payload_json))))
+            response = run._call_canonical_boundary(dict(payload, job_id=run.canonical_job_id, **command))
+            if (not isinstance(response, dict) or response.get('command_id') != command['command_id']
+                    or type(response.get('command_revision')) is not int
+                    or response['command_revision'] != command['expected_revision'] + 1
+                    or not isinstance(response.get('receipt'), dict)
+                    or response['receipt'].get('status') != 'cancelled'):
+                raise ValidationError('CANONICAL_COMMAND_CONFLICT')
+            run._apply_canonical_receipt(response['receipt'])
+            run._set_execution_values({'canonical_command_json': False,
+                                       'canonical_command_revision': response['command_revision']})
+            run._on_processing_complete()
+            return True
         if run.canonical_job_id:
             payload.update(action='receipt', job_id=run.canonical_job_id)
         else:
@@ -665,7 +696,7 @@ class FacodiPipelineRun(models.Model):
             vals.update(revision=self.revision + 1, history_json=json.dumps(history))
         return super().write(vals)
 
-    def _lock_command(self):
+    def _lock_command(self, *, allow_canonical=False):
         self.ensure_one()
         self._check_pipeline_enabled()
         self.check_access("write")
@@ -676,21 +707,34 @@ class FacodiPipelineRun(models.Model):
         if self.legacy_quarantined or self.env.company != self.company_id:
             raise AccessError("Commands require a verified run in its recorded company.")
         self._authorize_channel(self.target_channel_id, self.company_id, self.website_id)
-        if self.execution_plane == "supabase":
+        if self.execution_plane == "supabase" and not allow_canonical:
             raise UserError("Canonical execution commands require the Supabase boundary.")
 
     def _apply_command(self, command, expected_revision):
-        self._lock_command()
+        self._lock_command(allow_canonical=command == 'cancel')
         if type(expected_revision) is not int or expected_revision < 0:
             raise InvalidTransition("A nonnegative expected_revision is required.")
         # Replay identifies the exact already-applied command, never a fresh retry.
         if any(event.get("command") == command and event.get("from_revision") == expected_revision
                for event in json.loads(self.history_json or "[]")):
             return True
-        state = command_transition(self.status, command, self.revision, expected_revision)
+        if self.execution_plane == 'supabase' and command == 'cancel' and self.status == 'running':
+            if self.revision != expected_revision:
+                raise RevisionConflict('Run changed before cancellation was requested.')
+            state = 'cancelled'
+        else:
+            state = command_transition(self.status, command, self.revision, expected_revision)
         if command == "retry" and self.attempt_count >= 20:
             raise InvalidTransition("Attempt budget exhausted; submit a reviewed new request.")
-        self._record_transition({"status": state, "error_message": False}, command=command)
+        values = {"status": state, "error_message": False}
+        if self.execution_plane == 'supabase':
+            values['canonical_command_json'] = json.dumps({
+                'action': command, 'command_id': str(uuid.uuid4()),
+                'expected_revision': self.canonical_command_revision,
+            }, sort_keys=True)
+        self._record_transition(values, command=command)
+        if self.execution_plane == 'supabase':
+            self._on_processing_complete()
         return True
 
     def action_retry(self, expected_revision=None):

@@ -42,10 +42,20 @@ accepted snapshot identity/hash and an associated enriched document. Proposed
 targets must belong to that snapshot. Old immutable jobs without a catalog and
 old ASCII-encoded receipts retain compatible replay.
 
-Forty-four native API security tests passed locally. The deployment harness also
+Canonical cancellation accepts a versioned local intent without network I/O.
+It immediately blocks publication; the committed dispatcher recovers any lost
+job binding and delivers the same scoped command UUID until its exact
+acknowledgement is recorded. Technical receipt revisions do not change the
+command version. Supabase archives the queue message and fences the old claim
+atomically, preserving the prior receipt in an append-only service-only audit.
+Already active external I/O is not interrupted; its worker cannot checkpoint or
+finish after cancellation. Retry and new transcript revisions remain unavailable
+on this canonical slice. Legacy command policy and accepted inputs are unchanged.
+
+Forty-seven native API security tests passed locally. The deployment harness also
 proves one unpublished native Learning result/attempt and idempotent replay.
 Do not enable this candidate in production: worker scheduling, all-source and
-large-catalog parity, versioned retry/cancel/input, final integrated acceptance
+large-catalog parity, versioned retry/input, final integrated acceptance
 and productive target/image/canary proof remain required. Source test success is
 not runtime image identity. Owner CI retains native Project/API gates, real
 Project concurrency and repeated upgrades.
