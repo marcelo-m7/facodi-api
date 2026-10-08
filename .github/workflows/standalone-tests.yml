@@ -68,7 +68,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends python3-venv
           python3 -m venv --system-site-packages /opt/facodi-api-ci
-          /opt/facodi-api-ci/bin/python -m pip install --no-cache-dir -r requirements.txt
+          /opt/facodi-api-ci/bin/python -m pip install --no-cache-dir 'setuptools>=68.2.2' -r requirements.txt
           /opt/facodi-api-ci/bin/python -m pip check
       - name: Native API intake and security suite
         run: |
