@@ -493,7 +493,8 @@ class FacodiPipelineRun(models.Model):
         if values['source_type'] != 'youtube' and values['source_url']:
             raise UserError('The canonical text cohort does not acquire external document URLs.')
         request['provider_config'] = json.loads(values['provider_config_json'])
-        if len(json.dumps(request, ensure_ascii=False, allow_nan=False).encode('utf-8')) > 60000:
+        request['catalog_snapshot'] = json.loads(values['catalog_snapshot_json'])
+        if len(json.dumps(request, allow_nan=False).encode('utf-8')) > 60000:
             raise UserError('The accepted canonical request exceeds the transport budget.')
         return request
 
@@ -540,7 +541,7 @@ class FacodiPipelineRun(models.Model):
                     or receipt['status'] not in {'queued', 'processing', 'needs_review', 'failed'}
                     or not isinstance(receipt['result'], dict)):
                 raise ValueError()
-            encoded = json.dumps(receipt, sort_keys=True, allow_nan=False)
+            encoded = json.dumps(receipt, sort_keys=True, ensure_ascii=False, allow_nan=False)
             if len(encoded.encode('utf-8')) > 65536:
                 raise ValueError()
         except (KeyError, TypeError, ValueError):
@@ -550,7 +551,8 @@ class FacodiPipelineRun(models.Model):
         if receipt['revision'] < self.canonical_receipt_revision:
             return False
         if receipt['revision'] == self.canonical_receipt_revision:
-            if encoded != self.canonical_receipt_json:
+            saved = json.dumps(json.loads(self.canonical_receipt_json), sort_keys=True, ensure_ascii=False, allow_nan=False)
+            if encoded != saved:
                 raise ValidationError('CANONICAL_REVISION_CONFLICT')
             return False
         if self.status not in {'received', 'running'}:
@@ -569,6 +571,35 @@ class FacodiPipelineRun(models.Model):
                     or enriched.get('provider_name') != provider or enriched.get('model_name') != model
                     or not isinstance(result.get('chunks'), list)):
                 raise ValidationError('CANONICAL_RESULT_CONFLICT')
+            catalog = json.loads(self.canonical_payload_json).get('catalog_snapshot')
+            if catalog:
+                mapping = result.get('mapping_data', {})
+                if (not isinstance(mapping, dict) or mapping.get('snapshot_id') != catalog['snapshot_id']
+                        or mapping.get('snapshot_hash') != catalog['snapshot_hash']
+                        or mapping.get('ranking_algorithm_version') != 'deterministic-v2'
+                        or not isinstance(enriched.get('id'), str)
+                        or mapping.get('enriched_document_id') != enriched['id']
+                        or not isinstance(mapping.get('candidates'), list) or len(mapping['candidates']) > 5
+                        or not isinstance(mapping.get('unmatched_concepts'), list)
+                        or any(not isinstance(name, str) for name in mapping['unmatched_concepts'])):
+                    raise ValidationError('CANONICAL_MAPPING_CONFLICT')
+                targets = {target['id']: target for target in catalog['targets']}
+                seen = set()
+                for candidate in mapping['candidates']:
+                    if not isinstance(candidate, dict) or not isinstance(candidate.get('target_id'), str):
+                        raise ValidationError('CANONICAL_MAPPING_CONFLICT')
+                    target = targets.get(candidate['target_id'])
+                    if (not target or candidate['target_id'] in seen
+                            or candidate.get('target_name') != target['name'] or candidate.get('target_type') != target['type']
+                            or candidate.get('relation') != 'matches_course'
+                            or type(candidate.get('score')) not in (int, float) or not 0.25 <= candidate['score'] <= 1
+                            or type(candidate.get('confidence')) not in (int, float) or candidate['confidence'] != candidate['score']
+                            or not isinstance(candidate.get('justification'), str)
+                            or not isinstance(candidate.get('evidence'), list)
+                            or not isinstance(candidate.get('matched_concepts'), list)
+                            or any(not isinstance(term, str) for term in candidate['evidence'] + candidate['matched_concepts'])):
+                        raise ValidationError('CANONICAL_MAPPING_CONFLICT')
+                    seen.add(candidate['target_id'])
             values.update(status='waiting_review', metadata_json=json.dumps(result, ensure_ascii=False),
                           concepts_count=len(enriched.get('concepts', [])), chunks_count=len(result['chunks']),
                           error_message=False)

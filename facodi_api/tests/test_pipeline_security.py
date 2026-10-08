@@ -134,6 +134,10 @@ class TestPipelineSecurity(TransactionCase):
         request = json.loads(run.canonical_payload_json)
         self.assertEqual(request['raw_content'], run.raw_content)
         self.assertEqual(request['provider_config'], json.loads(run.provider_config_json))
+        self.assertEqual(request['catalog_snapshot'], json.loads(run.catalog_snapshot_json))
+        accepted = run.canonical_payload_json
+        self.channel.name = 'Human rename after acceptance'
+        self.assertEqual(run.canonical_payload_json, accepted)
         self.assertFalse(run.canonical_job_id)
 
     def test_canonical_unsupported_or_oversized_source_fails_before_acceptance(self):
@@ -144,6 +148,33 @@ class TestPipelineSecurity(TransactionCase):
             with self.assertRaises(UserError), self.env.cr.savepoint():
                 self.Run.create(values)
         self.assertEqual(self.env['facodi.pipeline.run'].search_count([]), before)
+
+    def test_canonical_ascii_transport_budget_rejects_without_partial_effects(self):
+        self.canonical_workspace()
+        self.channel.name = '\u00e9' * 6000
+        before = self.env['facodi.pipeline.run'].search_count([])
+        tasks_before = self.env['project.task'].search_count([])
+        with self.assertRaises(UserError), self.env.cr.savepoint():
+            self.Run.create(dict(self.values('canonical-escaped-budget'), raw_content='\U0001f600' * 3000))
+        self.assertEqual(self.env['facodi.pipeline.run'].search_count([]), before)
+        self.assertEqual(self.env['project.task'].search_count([]), tasks_before)
+
+    def test_canonical_legacy_payload_and_ascii_receipt_replay_remain_compatible(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-legacy-encoding'))
+        request = json.loads(run.canonical_payload_json)
+        request.pop('catalog_snapshot')
+        run._set_execution_values({'canonical_payload_json': json.dumps(request)})
+        result = {'document_data': {'text_content': run.raw_content, 'language': run.language},
+                  'enriched_data': {'summary': 'Reviewable \u00e9 evidence.', 'concepts': [],
+                                    'provider_name': 'baseline-deterministic', 'model_name': 'regex-frequency-v2-evidence'},
+                  'chunks': []}
+        receipt = self.canonical_receipt(run, status='needs_review', revision=2, attempt=1, result=result)
+        self.assertTrue(run._apply_canonical_receipt(receipt))
+        run._set_execution_values({'canonical_receipt_json': json.dumps(receipt, sort_keys=True, ensure_ascii=True)})
+        revision = run.revision
+        self.assertFalse(run._apply_canonical_receipt(receipt))
+        self.assertEqual(run.revision, revision)
 
     def test_canonical_receipt_replay_binds_stable_job_once(self):
         self.canonical_workspace()
@@ -191,13 +222,22 @@ class TestPipelineSecurity(TransactionCase):
         self.canonical_workspace()
         run = self.Run.create(self.values('canonical-result'))
         result = {'document_data': {'text_content': run.raw_content, 'language': run.language},
-                  'enriched_data': {'summary': 'A real reviewable paragraph.', 'concepts': [],
+                  'enriched_data': {'id': str(uuid4()), 'summary': 'A real reviewable paragraph.', 'concepts': [],
                                     'provider_name': 'baseline-deterministic', 'model_name': 'regex-frequency-v2-evidence'},
                   'chunks': []}
+        catalog = json.loads(run.catalog_snapshot_json)
+        result['mapping_data'] = {'snapshot_id': catalog['snapshot_id'], 'snapshot_hash': catalog['snapshot_hash'],
+                                 'enriched_document_id': result['enriched_data']['id'],
+                                 'ranking_algorithm_version': 'deterministic-v2', 'candidates': [], 'unmatched_concepts': []}
         receipt = self.canonical_receipt(run, status='needs_review', revision=6, attempt=4, result=result)
         invalid = dict(result, document_data={'text_content': 'Different source', 'language': 'pt'})
         with self.assertRaises(ValidationError):
             run._apply_canonical_receipt(dict(receipt, result=invalid))
+        for mapping in [dict(result['mapping_data'], snapshot_hash='0' * 64),
+                        dict(result['mapping_data'], candidates=[{'target_id': 'channel_999999999'}]),
+                        dict(result['mapping_data'], enriched_document_id=str(uuid4()))]:
+            with self.assertRaises(ValidationError):
+                run._apply_canonical_receipt(dict(receipt, result=dict(result, mapping_data=mapping)))
         run._apply_canonical_receipt(receipt)
         self.assertEqual(run.status, 'waiting_review')
         self.assertFalse(run.published_slide_id)

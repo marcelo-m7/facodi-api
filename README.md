@@ -35,10 +35,17 @@ The server-only target is the approved FACODI Supabase project and modern secret
 Legacy providers, binary documents and old accepted runs retain their old route
 when canonical intake is disabled.
 
-Forty-two native API security tests passed locally. The deployment harness also
+The accepted dispatch includes the complete authorized frozen course catalog,
+within the 60000-byte ASCII JSON transport budget; oversized snapshots fail
+before acceptance rather than being truncated. Review receipts must carry the
+accepted snapshot identity/hash and an associated enriched document. Proposed
+targets must belong to that snapshot. Old immutable jobs without a catalog and
+old ASCII-encoded receipts retain compatible replay.
+
+Forty-four native API security tests passed locally. The deployment harness also
 proves one unpublished native Learning result/attempt and idempotent replay.
 Do not enable this candidate in production: worker scheduling, all-source and
-catalog-mapping parity, versioned retry/cancel/input, final integrated acceptance
+large-catalog parity, versioned retry/cancel/input, final integrated acceptance
 and productive target/image/canary proof remain required. Source test success is
 not runtime image identity. Owner CI retains native Project/API gates, real
 Project concurrency and repeated upgrades.
