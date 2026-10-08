@@ -23,6 +23,9 @@ defaults to false. Its scheduler uses a separate transaction: uncommitted intake
 never reaches the network. Lost acceptance responses replay the native task key
 and bind the same external job UUID. Unchanged polls cannot starve later jobs;
 terminal projection has only one local revision. Human task fields are untouched.
+Terminal failures create one native review activity for the course responsible
+user (or accepted owner), without technical payload; identical replay creates
+neither another activity nor another editorial revision.
 
 The first cohort supports explicit manual/Markdown text and explicit YouTube
 transcripts up to 12000 UTF-8 bytes. Unsupported sources fail before intake; no

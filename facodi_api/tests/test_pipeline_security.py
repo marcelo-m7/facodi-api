@@ -215,6 +215,13 @@ class TestPipelineSecurity(TransactionCase):
         self.assertEqual(run.status, 'failed')
         self.assertEqual(run.revision, before + 1)
         self.assertFalse(run.canonical_polled_at)
+        self.assertEqual(len(run.task_id.activity_ids), 1)
+        activity = run.task_id.activity_ids
+        self.assertEqual(activity.user_id, self.channel.user_id)
+        self.assertEqual(activity.summary, 'Canonical processing requires review')
+        self.assertFalse(activity.note)
+        self.assertFalse(run._apply_canonical_receipt(receipt))
+        self.assertEqual(run.task_id.activity_ids, activity)
 
     def test_health_reports_loaded_addon_version(self):
         import json

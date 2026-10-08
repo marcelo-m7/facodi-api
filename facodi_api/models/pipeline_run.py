@@ -578,6 +578,10 @@ class FacodiPipelineRun(models.Model):
             values.update(status='running')
         self.task_id.facodi_bind_receipt(job_id)
         self._set_execution_values(values)
+        if receipt['status'] == 'failed':
+            self.task_id.activity_schedule('mail.mail_activity_data_todo',
+                                          user_id=self.target_channel_id.user_id.id or self.owner_id.id,
+                                          summary='Canonical processing requires review')
         if receipt['status'] in {'needs_review', 'failed'}:
             self._on_processing_complete()
         return True
