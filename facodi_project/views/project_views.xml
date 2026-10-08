@@ -1,0 +1,59 @@
+<odoo>
+    <record id="project_form_identity" model="ir.ui.view">
+        <field name="name">project.project.form.facodi.identity</field>
+        <field name="model">project.project</field>
+        <field name="inherit_id" ref="project.edit_project"/>
+        <field name="arch" type="xml">
+            <xpath expr="//group[@name='extra_settings']" position="inside">
+                <group string="FACODI" groups="project.group_project_manager">
+                    <field name="facodi_managed"/>
+                    <field name="facodi_kind" invisible="not facodi_managed"/>
+                    <field name="facodi_automation_mode" invisible="not facodi_managed"/>
+                    <field name="facodi_ref" invisible="not facodi_managed"/>
+                </group>
+            </xpath>
+        </field>
+    </record>
+    <record id="task_form_identity" model="ir.ui.view">
+        <field name="name">project.task.form.facodi.identity</field>
+        <field name="model">project.task</field>
+        <field name="inherit_id" ref="project.view_task_form2"/>
+        <field name="arch" type="xml">
+            <xpath expr="//notebook" position="inside">
+                <page string="FACODI" name="facodi_identity" groups="facodi_project.group_facodi_operations,project.group_project_manager">
+                    <group>
+                        <field name="facodi_kind" readonly="1"/>
+                        <field name="facodi_origin" readonly="1"/>
+                        <field name="facodi_ref"/>
+                        <field name="facodi_external_ref"/>
+                        <field name="facodi_idempotency_key"/>
+                    </group>
+                </page>
+            </xpath>
+        </field>
+    </record>
+    <record id="task_search_identity" model="ir.ui.view">
+        <field name="name">project.task.search.facodi.identity</field>
+        <field name="model">project.task</field>
+        <field name="inherit_id" ref="project.view_task_search_form_base"/>
+        <field name="arch" type="xml">
+            <xpath expr="//search" position="inside">
+                <field name="facodi_ref" groups="facodi_project.group_facodi_operations,project.group_project_manager"/>
+                <field name="facodi_kind" groups="facodi_project.group_facodi_operations,project.group_project_manager"/>
+                <field name="facodi_external_ref" groups="facodi_project.group_facodi_operations,project.group_project_manager"/>
+            </xpath>
+        </field>
+    </record>
+    <record id="task_kanban_identity" model="ir.ui.view">
+        <field name="name">project.task.kanban.facodi.identity</field>
+        <field name="model">project.task</field>
+        <field name="inherit_id" ref="project.view_task_kanban"/>
+        <field name="arch" type="xml">
+            <xpath expr="//templates/t[@t-name='card']" position="inside">
+                <div class="text-muted small o_text_overflow" groups="facodi_project.group_facodi_operations,project.group_project_manager">
+                    <field name="facodi_kind"/> <field name="facodi_origin"/>
+                </div>
+            </xpath>
+        </field>
+    </record>
+</odoo>
