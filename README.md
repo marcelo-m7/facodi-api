@@ -2,6 +2,27 @@
 
 This repository owns FACODI technical processing: ingestion, normalization, enrichment, jobs, checkpoints and proposed matching. Its Python core is independent of Odoo and Learning. The Odoo facade and HTTP transport share authorized commands; Learning owns editorial results, courses, content, review and publication. Supabase and Stripe bridges remain separate integrations.
 
+## INC-P2 Intake Candidate
+
+Version `19.0.3.4.0` introduces the first disabled-by-default cutover slice,
+not a complete Supabase executor. The independent `facodi_project` addon remains
+Project-only; API now consumes it. Future technical execution belongs to Supabase,
+while the existing Python engine remains the frozen compatibility route.
+
+Only administrators may configure `facodi_api.canonical_intake_enabled` and
+`facodi_api.canonical_workspace.<website_id>` using an explicitly managed Project
+ID in the Website company. Intake freezes `execution_plane` and creates/reuses
+one canonical task atomically. Replay after route changes preserves the accepted
+executor and human work; the old cron/commands cannot process canonical jobs.
+Old runs are not adopted or backfilled. Missing or inaccessible workspaces fail
+closed, without per-run fallback Projects or mandatory technical subtasks.
+
+Do not enable this candidate in production: recoverable Supabase dispatch,
+authenticated monotonic receipts, Learning consumer cutover and full provider
+recovery/remote acceptance are still required. Source test success is not runtime
+image identity or proof that analysis has completed. Owner CI runs pure tests,
+native Project and API suites, real Project concurrency and repeated upgrades.
+
 ## Structure
 
 - `facodi_api/` — installable Odoo addon

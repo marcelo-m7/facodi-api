@@ -31,6 +31,93 @@ class TestPipelineSecurity(TransactionCase):
         return {'source_type': 'manual', 'raw_content': 'A real reviewable paragraph.',
                 'idempotency_key': key, 'target_channel_id': self.channel.id}
 
+    def canonical_workspace(self):
+        workspace = self.env['project.project'].create({
+            'name': 'Permanent content workspace', 'facodi_managed': True,
+            'company_id': self.env.company.id, 'privacy_visibility': 'employees',
+        })
+        parameters = self.env['ir.config_parameter'].sudo()
+        parameters.set_param('facodi_api.canonical_intake_enabled', 'true')
+        parameters.set_param('facodi_api.canonical_workspace.%s' % self.channel.website_id.id, workspace.id)
+        return workspace
+
+    def test_canonical_intake_replay_preserves_route_and_human_task(self):
+        workspace = self.canonical_workspace()
+        projects_before = self.env['project.project'].search_count([])
+        tasks_before = self.env['project.task'].search_count([])
+        first = self.Run.submit(self.values('canonical'))
+        run = self.Run.browse(first['id'])
+        self.assertEqual(run.execution_plane, 'supabase')
+        self.assertEqual(run.project_id, workspace)
+        self.assertTrue(run.task_id.facodi_ref)
+        run.task_id.write({'name': 'Human decision', 'description': 'Keep authored work'})
+        self.env['ir.config_parameter'].sudo().set_param('facodi_api.canonical_intake_enabled', 'false')
+        replay = self.Run.submit(self.values('canonical'))
+        self.assertEqual(replay['id'], first['id'])
+        run._ensure_project_task()
+        run._sync_to_project_task()
+        self.assertEqual(run.execution_plane, 'supabase')
+        self.assertEqual(run.task_id.name, 'Human decision')
+        self.assertEqual(run.task_id.description, '<p>Keep authored work</p>')
+        self.assertEqual(self.env['project.project'].search_count([]), projects_before)
+        self.assertEqual(self.env['project.task'].search_count([]), tasks_before + 1)
+        self.assertFalse(run.task_id.child_ids)
+
+    def test_canonical_intake_requires_workspace_without_partial_effects(self):
+        self.env['ir.config_parameter'].sudo().set_param('facodi_api.canonical_intake_enabled', 'true')
+        before = self.env['facodi.pipeline.run'].search_count([])
+        projects_before = self.env['project.project'].search_count([])
+        with self.assertRaises(UserError), self.env.cr.savepoint():
+            self.Run.submit(self.values('missing-workspace'))
+        self.assertEqual(self.env['facodi.pipeline.run'].search_count([]), before)
+        self.assertEqual(self.env['project.project'].search_count([]), projects_before)
+
+    def test_canonical_execution_is_never_claimed_by_legacy_worker(self):
+        self.canonical_workspace()
+        run = self.Run.browse(self.Run.submit(self.values('canonical-worker'))['id'])
+        with self.assertRaises(UserError):
+            run.action_execute_pipeline()
+        self.assertFalse(self.env['facodi.pipeline.run'].cron_process_received_runs())
+        self.assertEqual(run.status, 'received')
+        self.assertEqual(run.attempt_count, 0)
+
+    def test_existing_legacy_intake_is_not_adopted_after_route_enablement(self):
+        first = self.Run.submit(self.values('legacy-route'))
+        run = self.Run.browse(first['id'])
+        original_project = run.project_id
+        original_task = run.task_id
+        self.canonical_workspace()
+        replay = self.Run.submit(self.values('legacy-route'))
+        self.assertEqual(replay['id'], first['id'])
+        self.assertEqual(run.execution_plane, 'odoo_python')
+        self.assertEqual(run.project_id, original_project)
+        self.assertEqual(run.task_id, original_task)
+        self.assertFalse(original_project.facodi_managed)
+        self.assertFalse(original_task.facodi_ref)
+
+    def test_canonical_executor_cannot_be_forged_or_replaced(self):
+        self.canonical_workspace()
+        with self.assertRaises(AccessError):
+            self.Run.create(dict(self.values('forged-plane'), execution_plane='odoo_python'))
+        run = self.Run.with_context(default_execution_plane='odoo_python').create(self.values('frozen-plane'))
+        self.assertEqual(run.execution_plane, 'supabase')
+        with self.assertRaises(AccessError):
+            run.with_context(facodi_pipeline_internal=True).write({'execution_plane': 'odoo_python'})
+        with self.assertRaises(UserError):
+            run.action_cancel(expected_revision=run.revision)
+        self.assertEqual(run.status, 'received')
+
+    def test_canonical_intake_and_task_roll_back_together(self):
+        self.canonical_workspace()
+        runs_before = self.env['facodi.pipeline.run'].search_count([])
+        tasks_before = self.env['project.task'].search_count([])
+        with self.assertRaises(ValidationError), self.env.cr.savepoint():
+            run = self.Run.create(self.values('atomic-canonical'))
+            self.assertTrue(run.task_id.facodi_ref)
+            raise ValidationError('Reject the uncommitted downstream receipt')
+        self.assertEqual(self.env['facodi.pipeline.run'].search_count([]), runs_before)
+        self.assertEqual(self.env['project.task'].search_count([]), tasks_before)
+
     def test_health_reports_loaded_addon_version(self):
         import json
         from ..controllers.api import FacodiApiController

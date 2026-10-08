@@ -100,6 +100,10 @@ class FacodiPipelineRun(models.Model):
 
     project_id = fields.Many2one("project.project", string="Project", ondelete="set null")
     task_id = fields.Many2one("project.task", string="Project Task", ondelete="set null")
+    execution_plane = fields.Selection(
+        [("odoo_python", "Legacy Odoo Python"), ("supabase", "Canonical Supabase")],
+        required=True, default="odoo_python", readonly=True, copy=False, index=True,
+    )
     target_channel_id = fields.Many2one("slide.channel", string="Publication Course", index=True, ondelete="restrict")
     published_slide_id = fields.Many2one("slide.slide", string="Published Content", readonly=True, copy=False, ondelete="restrict")
     reviewed_by_id = fields.Many2one("res.users", string="Reviewed By", readonly=True, copy=False)
@@ -428,12 +432,16 @@ class FacodiPipelineRun(models.Model):
             vals = self._normalize_submission(values)
             channel = self.env["slide.channel"].browse(vals["target_channel_id"])
             self._authorize_channel(channel, self.env.company)
+            workspace = self._canonical_workspace(channel.website_id)
             vals.update({
                 "run_id": str(uuid.uuid4()), "owner_id": self.env.user.id,
                 "company_id": self.env.company.id, "website_id": channel.website_id.id,
                 "request_hash": self._submission_fingerprint(vals), "status": "received",
                 "name": vals["name"] or vals["title"] or "Content intake",
+                "execution_plane": "supabase" if workspace else "odoo_python",
             })
+            if workspace:
+                vals["project_id"] = workspace.id
             if vals['attachment_id']:
                 _content, digest, filename = self._attachment_details(vals['attachment_id'], channel.id)
                 vals.update(attachment_digest=digest, attachment_name_snapshot=filename)
@@ -450,6 +458,21 @@ class FacodiPipelineRun(models.Model):
         for run in runs:
             run._ensure_project_task()
         return runs
+
+    @api.model
+    def _canonical_workspace(self, website):
+        parameters = self.env["ir.config_parameter"].sudo()
+        enabled = parameters.get_param("facodi_api.canonical_intake_enabled", "false")
+        if enabled.lower() not in ("true", "1"):
+            return self.env["project.project"]
+        value = parameters.get_param("facodi_api.canonical_workspace.%s" % website.id, "")
+        if not isinstance(value, str) or not value.isdecimal() or int(value) <= 0:
+            raise UserError("Configure an explicit managed workspace for this Website.")
+        workspace = self.env["project.project"].browse(int(value)).exists()
+        self.env["project.task"]._facodi_check_workspace(workspace)
+        if workspace.company_id != website.company_id:
+            raise AccessError("The managed workspace must belong to the Website company.")
+        return workspace
 
     def write(self, vals):
         if set(vals) - {"name"}:
@@ -486,6 +509,8 @@ class FacodiPipelineRun(models.Model):
         if self.legacy_quarantined or self.env.company != self.company_id:
             raise AccessError("Commands require a verified run in its recorded company.")
         self._authorize_channel(self.target_channel_id, self.company_id, self.website_id)
+        if self.execution_plane == "supabase":
+            raise UserError("Canonical execution commands require the Supabase boundary.")
 
     def _apply_command(self, command, expected_revision):
         self._lock_command()
@@ -571,6 +596,8 @@ class FacodiPipelineRun(models.Model):
         self.ensure_one()
         self._check_pipeline_enabled()
         self.check_access("write")
+        if self.execution_plane == "supabase":
+            raise UserError("Canonical executions cannot use the legacy Odoo executor.")
         self.env.cr.execute("SELECT id FROM facodi_pipeline_run WHERE id = %s FOR UPDATE SKIP LOCKED", [self.id])
         if not self.env.cr.fetchone():
             return False
@@ -629,6 +656,8 @@ class FacodiPipelineRun(models.Model):
     def _sync_to_project_task(self):
         """Create or update a mirrored task in project.project / project.task."""
         self.ensure_one()
+        if self.execution_plane == "supabase":
+            return False
         if "project.task" not in self.env:
             return
 
@@ -659,6 +688,20 @@ class FacodiPipelineRun(models.Model):
     def _ensure_project_task(self):
         """Create private review work as soon as a run is accepted."""
         self.ensure_one()
+        if self.execution_plane == "supabase":
+            if not self.project_id:
+                raise UserError("Canonical execution requires its accepted managed workspace.")
+            receipt = self.env["project.task"].facodi_ensure_task(
+                self.project_id.id,
+                self.title or self.name,
+                idempotency_key="api-run:%s" % self.run_id,
+                kind="execution", origin="api",
+            )
+            if self.task_id and self.task_id.id != receipt["id"]:
+                raise ValidationError("Canonical task identity conflicts with the accepted execution.")
+            if not self.task_id:
+                self._set_execution_values({"task_id": receipt["id"]})
+            return
         if self.project_id and self.task_id:
             return
 
@@ -844,7 +887,7 @@ class FacodiPipelineRun(models.Model):
         self._reconcile_processing_receipts()
         self.env.cr.execute(
             """SELECT id FROM facodi_pipeline_run
-               WHERE status = 'received'
+                    WHERE status = 'received' AND execution_plane = 'odoo_python'
                ORDER BY id
                LIMIT 1
                FOR UPDATE SKIP LOCKED"""
