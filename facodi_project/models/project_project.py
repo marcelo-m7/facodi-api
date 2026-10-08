@@ -14,7 +14,6 @@ class ProjectProject(models.Model):
     facodi_kind = fields.Char(groups="project.group_project_user")
     facodi_automation_mode = fields.Selection(
         [("auto", "Automatic"), ("exception", "Exceptions"), ("manual", "Manual")],
-        default="auto",
         groups="project.group_project_user",
     )
 
@@ -34,6 +33,7 @@ class ProjectProject(models.Model):
                 if values["company_id"] not in self.env.companies.ids:
                     raise AccessError("The workspace company is not allowed.")
                 values["facodi_ref"] = reference(values.get("facodi_ref"), "project")
+                values.setdefault("facodi_automation_mode", "auto")
             elif values.get("facodi_ref"):
                 raise ValidationError("Only an explicitly managed workspace has a FACODI reference.")
             prepared.append(values)
@@ -56,13 +56,14 @@ class ProjectProject(models.Model):
         if values.get("facodi_managed"):
             self.check_access("write")
             for project in self:
+                project_values = dict(values)
+                project_values.setdefault("facodi_automation_mode", project.facodi_automation_mode or "auto")
                 if not project.facodi_ref:
-                    project_values = dict(values)
                     project_values["facodi_ref"] = reference(False, "project")
                     project_values["company_id"] = project.company_id.id or self.env.company.id
                     super(ProjectProject, project).write(project_values)
                 else:
-                    super(ProjectProject, project).write(values)
+                    super(ProjectProject, project).write(project_values)
             return True
         return super().write(values)
 

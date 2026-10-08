@@ -7,6 +7,20 @@ class TestProjectIdentity(TransactionCase):
         project = self.env["project.project"].create({"name": "Native workspace"})
         self.assertFalse(project.facodi_managed)
         self.assertFalse(project.facodi_ref)
+        self.assertFalse(project.facodi_automation_mode)
+
+    def test_policy_defaults_only_on_explicit_management_without_task_backfill(self):
+        project = self.env["project.project"].create({"name": "Native opt-in workspace"})
+        task = self.env["project.task"].create({"name": "Existing human work", "project_id": project.id})
+        project.write({"facodi_managed": True})
+        self.assertEqual(project.facodi_automation_mode, "auto")
+        self.assertTrue(project.facodi_ref)
+        self.assertFalse(task.facodi_ref)
+        manual = self.env["project.project"].create({
+            "name": "Manual workspace", "facodi_managed": True, "facodi_automation_mode": "manual",
+        })
+        manual.write({"facodi_managed": True})
+        self.assertEqual(manual.facodi_automation_mode, "manual")
 
     def test_managed_project_identity_survives_rename(self):
         project = self.env["project.project"].create(
