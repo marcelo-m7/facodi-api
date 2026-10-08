@@ -1,6 +1,8 @@
 """Exercise ORM boundaries in the real Odoo registry (not source-text assertions)."""
 import importlib.util
 import unittest
+import json
+from uuid import uuid4
 from unittest.mock import patch
 
 if importlib.util.find_spec("odoo") is None:
@@ -117,6 +119,102 @@ class TestPipelineSecurity(TransactionCase):
             raise ValidationError('Reject the uncommitted downstream receipt')
         self.assertEqual(self.env['facodi.pipeline.run'].search_count([]), runs_before)
         self.assertEqual(self.env['project.task'].search_count([]), tasks_before)
+
+    def canonical_receipt(self, run, **values):
+        receipt = {'job_id': str(uuid4()), 'task_ref': run.task_id.facodi_ref,
+                   'company_id': run.company_id.id, 'cohort': 'p2', 'revision': 1,
+                   'status': 'queued', 'attempt': 0, 'result': {}}
+        receipt.update(values)
+        return receipt
+
+    def test_canonical_intake_freezes_request_without_network(self):
+        self.canonical_workspace()
+        with patch.object(type(self.Run), '_call_canonical_boundary', side_effect=AssertionError('No network during acceptance')):
+            run = self.Run.create(self.values('canonical-outbox'))
+        request = json.loads(run.canonical_payload_json)
+        self.assertEqual(request['raw_content'], run.raw_content)
+        self.assertEqual(request['provider_config'], json.loads(run.provider_config_json))
+        self.assertFalse(run.canonical_job_id)
+
+    def test_canonical_unsupported_or_oversized_source_fails_before_acceptance(self):
+        self.canonical_workspace()
+        before = self.env['facodi.pipeline.run'].search_count([])
+        for values in [dict(self.values('canonical-document'), source_type='document'),
+                       dict(self.values('canonical-large'), raw_content='x' * 12001)]:
+            with self.assertRaises(UserError), self.env.cr.savepoint():
+                self.Run.create(values)
+        self.assertEqual(self.env['facodi.pipeline.run'].search_count([]), before)
+
+    def test_canonical_receipt_replay_binds_stable_job_once(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-bind'))
+        receipt = self.canonical_receipt(run)
+        self.assertTrue(run._apply_canonical_receipt(receipt))
+        revision = run.revision
+        self.assertFalse(run._apply_canonical_receipt(receipt))
+        self.assertEqual(run.revision, revision)
+        self.assertEqual(run.task_id.facodi_external_ref, receipt['job_id'])
+        with self.assertRaises(ValidationError):
+            run._apply_canonical_receipt(dict(receipt, job_id=str(uuid4()), revision=2))
+
+    def test_canonical_dispatch_polling_does_not_starve_later_executions(self):
+        self.canonical_workspace()
+        first = self.Run.create(self.values('canonical-first-poll'))
+        second = self.Run.create(self.values('canonical-second-poll'))
+        called = []
+
+        def boundary(run, payload):
+            called.append(run.id)
+            return self.canonical_receipt(run)
+
+        with patch.object(type(self.Run), '_call_canonical_boundary', boundary):
+            self.env['facodi.pipeline.run']._dispatch_canonical_receipts()
+            self.env['facodi.pipeline.run']._dispatch_canonical_receipts()
+        self.assertEqual(called, [first.id, second.id])
+        self.assertTrue(first.canonical_polled_at)
+        self.assertTrue(second.canonical_polled_at)
+
+    def test_canonical_receipt_denies_scope_and_revision_conflicts(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-scope'))
+        receipt = self.canonical_receipt(run)
+        for change in [{'company_id': run.company_id.id + 1}, {'task_ref': 'task:' + str(uuid4())},
+                       {'cohort': 'legacy'}, {'status': 'published'}, {'revision': True}]:
+            with self.assertRaises(ValidationError):
+                run._apply_canonical_receipt(dict(receipt, **change))
+        run._apply_canonical_receipt(receipt)
+        with self.assertRaises(ValidationError):
+            run._apply_canonical_receipt(dict(receipt, status='processing'))
+        self.assertEqual(run.status, 'received')
+
+    def test_canonical_terminal_receipt_requires_accepted_source_provider_and_no_publication(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-result'))
+        result = {'document_data': {'text_content': run.raw_content, 'language': run.language},
+                  'enriched_data': {'summary': 'A real reviewable paragraph.', 'concepts': [],
+                                    'provider_name': 'baseline-deterministic', 'model_name': 'regex-frequency-v2-evidence'},
+                  'chunks': []}
+        receipt = self.canonical_receipt(run, status='needs_review', revision=6, attempt=4, result=result)
+        invalid = dict(result, document_data={'text_content': 'Different source', 'language': 'pt'})
+        with self.assertRaises(ValidationError):
+            run._apply_canonical_receipt(dict(receipt, result=invalid))
+        run._apply_canonical_receipt(receipt)
+        self.assertEqual(run.status, 'waiting_review')
+        self.assertFalse(run.published_slide_id)
+        self.assertFalse(run.reviewed_by_id)
+        self.assertFalse(run._apply_canonical_receipt(receipt))
+
+    def test_canonical_terminal_poll_has_no_second_editorial_revision(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-terminal-poll'))
+        receipt = self.canonical_receipt(run, status='failed', revision=3, attempt=1,
+                                         result={'error_code': 'ATTEMPT_BUDGET_EXHAUSTED'})
+        before = run.revision
+        with patch.object(type(self.Run), '_call_canonical_boundary', return_value=receipt):
+            self.env['facodi.pipeline.run']._dispatch_canonical_receipts()
+        self.assertEqual(run.status, 'failed')
+        self.assertEqual(run.revision, before + 1)
+        self.assertFalse(run.canonical_polled_at)
 
     def test_health_reports_loaded_addon_version(self):
         import json

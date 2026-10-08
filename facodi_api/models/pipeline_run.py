@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import uuid
+import requests
 from html import escape
 
 from odoo import api, fields, models, tools
@@ -104,6 +105,11 @@ class FacodiPipelineRun(models.Model):
         [("odoo_python", "Legacy Odoo Python"), ("supabase", "Canonical Supabase")],
         required=True, default="odoo_python", readonly=True, copy=False, index=True,
     )
+    canonical_payload_json = fields.Text(readonly=True, copy=False)
+    canonical_job_id = fields.Char(readonly=True, copy=False, index=True)
+    canonical_receipt_revision = fields.Integer(readonly=True, default=0, copy=False)
+    canonical_receipt_json = fields.Text(readonly=True, copy=False)
+    canonical_polled_at = fields.Datetime(readonly=True, copy=False)
     target_channel_id = fields.Many2one("slide.channel", string="Publication Course", index=True, ondelete="restrict")
     published_slide_id = fields.Many2one("slide.slide", string="Published Content", readonly=True, copy=False, ondelete="restrict")
     reviewed_by_id = fields.Many2one("res.users", string="Reviewed By", readonly=True, copy=False)
@@ -451,6 +457,8 @@ class FacodiPipelineRun(models.Model):
                 vals['existing_slide_hash'] = self._canonical_source_hash(slide)
             vals['provider_config_json'] = json.dumps(self._server_provider_configuration(), sort_keys=True)
             vals['catalog_snapshot_json'] = json.dumps(self._build_catalog_snapshot(channel).to_dict(), ensure_ascii=False)
+            if workspace:
+                vals['canonical_payload_json'] = json.dumps(self._canonical_request(vals), sort_keys=True, allow_nan=False)
             prepared.append(vals)
         clean_context = {key: value for key, value in self.env.context.items() if not key.startswith("default_")}
         trusted_model = self.with_context(clean_context)
@@ -473,6 +481,130 @@ class FacodiPipelineRun(models.Model):
         if workspace.company_id != website.company_id:
             raise AccessError("The managed workspace must belong to the Website company.")
         return workspace
+
+    @api.model
+    def _canonical_request(self, values):
+        if (values['source_type'] not in {'manual', 'markdown', 'youtube'}
+                or values['attachment_id'] or not values['raw_content'].strip()
+                or (values['source_type'] == 'youtube' and not values['is_manual_transcript'])
+                or len(values['raw_content'].encode('utf-8')) > 12000):
+            raise UserError('The canonical text cohort requires a bounded explicit transcript; no source is truncated or acquired implicitly.')
+        request = {name: values[name] for name in ('source_type', 'source_url', 'title', 'raw_content', 'language')}
+        if values['source_type'] != 'youtube' and values['source_url']:
+            raise UserError('The canonical text cohort does not acquire external document URLs.')
+        request['provider_config'] = json.loads(values['provider_config_json'])
+        if len(json.dumps(request, ensure_ascii=False, allow_nan=False).encode('utf-8')) > 60000:
+            raise UserError('The accepted canonical request exceeds the transport budget.')
+        return request
+
+    def _call_canonical_boundary(self, payload):
+        self.ensure_one()
+        host = (os.environ.get('SUPABASE_URL') or '').rstrip('/')
+        secret = (os.environ.get('SUPABASE_SECRET_KEY') or '').strip()
+        if host != 'https://bhfywztfyidvrlarebmg.supabase.co' or not secret.startswith('sb_secret_'):
+            raise UserError('The approved canonical service target and secret credential are required.')
+        with requests.Session() as session:
+            session.trust_env = False
+            with session.post(host + '/functions/v1/v4_canonical_analysis',
+                              json=payload, headers={'apikey': secret}, timeout=(5, 15),
+                              allow_redirects=False, stream=True) as response:
+                if response.status_code not in (200, 202):
+                    raise UserError('CANONICAL_BOUNDARY_UNAVAILABLE')
+                parts, size = [], 0
+                for part in response.iter_content(chunk_size=8192):
+                    size += len(part)
+                    if size > 65536:
+                        raise UserError('CANONICAL_RECEIPT_TOO_LARGE')
+                    parts.append(part)
+                try:
+                    result = json.loads(b''.join(parts), parse_constant=lambda value: (_ for _ in ()).throw(ValueError()))
+                    return result['receipt']
+                except (KeyError, TypeError, ValueError):
+                    raise UserError('INVALID_CANONICAL_RECEIPT') from None
+
+    def _apply_canonical_receipt(self, receipt):
+        self.ensure_one()
+        self.check_access('write')
+        if self.execution_plane != 'supabase' or self.env.company != self.company_id:
+            raise AccessError('The accepted canonical execution scope is required.')
+        self._authorize_channel(self.target_channel_id, self.company_id, self.website_id)
+        self.env.cr.execute('SELECT id FROM facodi_pipeline_run WHERE id = %s FOR UPDATE', [self.id])
+        self.invalidate_recordset()
+        try:
+            job_id = receipt['job_id']
+            if not isinstance(job_id, str) or str(uuid.UUID(job_id)) != job_id:
+                raise ValueError()
+            if (receipt['task_ref'] != self.task_id.facodi_ref or receipt['company_id'] != self.company_id.id
+                    or receipt['cohort'] != 'p2' or type(receipt['revision']) is not int or receipt['revision'] <= 0
+                    or type(receipt['attempt']) is not int or not 0 <= receipt['attempt'] <= 2147483647
+                    or receipt['status'] not in {'queued', 'processing', 'needs_review', 'failed'}
+                    or not isinstance(receipt['result'], dict)):
+                raise ValueError()
+            encoded = json.dumps(receipt, sort_keys=True, allow_nan=False)
+            if len(encoded.encode('utf-8')) > 65536:
+                raise ValueError()
+        except (KeyError, TypeError, ValueError):
+            raise ValidationError('INVALID_CANONICAL_RECEIPT') from None
+        if self.canonical_job_id and self.canonical_job_id != job_id:
+            raise ValidationError('CANONICAL_IDENTITY_CONFLICT')
+        if receipt['revision'] < self.canonical_receipt_revision:
+            return False
+        if receipt['revision'] == self.canonical_receipt_revision:
+            if encoded != self.canonical_receipt_json:
+                raise ValidationError('CANONICAL_REVISION_CONFLICT')
+            return False
+        if self.status not in {'received', 'running'}:
+            raise ValidationError('CANONICAL_TERMINAL_CONFLICT')
+        values = {'canonical_job_id': job_id, 'canonical_receipt_revision': receipt['revision'],
+                  'canonical_receipt_json': encoded, 'attempt_count': receipt['attempt']}
+        if receipt['status'] == 'needs_review':
+            result = receipt['result']
+            source, enriched = result.get('document_data', {}), result.get('enriched_data', {})
+            accepted = json.loads(self.provider_config_json)
+            provider = 'baseline-deterministic' if accepted['provider'] == 'baseline' else 'gemini-structured'
+            model = accepted['version'] if accepted['provider'] == 'baseline' else accepted['model']
+            if (not isinstance(source, dict) or not isinstance(enriched, dict)
+                    or source.get('text_content') != self.raw_content or source.get('language') != self.language
+                    or not isinstance(enriched.get('summary'), str) or not enriched['summary'].strip()
+                    or enriched.get('provider_name') != provider or enriched.get('model_name') != model
+                    or not isinstance(result.get('chunks'), list)):
+                raise ValidationError('CANONICAL_RESULT_CONFLICT')
+            values.update(status='waiting_review', metadata_json=json.dumps(result, ensure_ascii=False),
+                          concepts_count=len(enriched.get('concepts', [])), chunks_count=len(result['chunks']),
+                          error_message=False)
+        elif receipt['status'] == 'failed':
+            values.update(status='failed', error_message='CANONICAL_PROCESSING_FAILED')
+        elif receipt['status'] == 'processing':
+            values.update(status='running')
+        self.task_id.facodi_bind_receipt(job_id)
+        self._set_execution_values(values)
+        if receipt['status'] in {'needs_review', 'failed'}:
+            self._on_processing_complete()
+        return True
+
+    @api.model
+    def _dispatch_canonical_receipts(self):
+        self.flush_model(['execution_plane', 'status', 'canonical_polled_at'])
+        self.env.cr.execute("""SELECT id FROM facodi_pipeline_run
+            WHERE execution_plane = 'supabase' AND status IN ('received', 'running')
+            ORDER BY canonical_polled_at NULLS FIRST, id LIMIT 1 FOR UPDATE SKIP LOCKED""")
+        row = self.env.cr.fetchone()
+        if not row:
+            return False
+        run = self.browse(row[0])
+        run = run.with_user(run.owner_id).with_context(allowed_company_ids=[run.company_id.id]).with_company(run.company_id)
+        run.check_access('write')
+        run._authorize_channel(run.target_channel_id, run.company_id, run.website_id)
+        payload = {'task_ref': run.task_id.facodi_ref, 'company_id': run.company_id.id, 'cohort': 'p2'}
+        if run.canonical_job_id:
+            payload.update(action='receipt', job_id=run.canonical_job_id)
+        else:
+            payload.update(action='submit', request=json.loads(run.canonical_payload_json))
+        run._apply_canonical_receipt(run._call_canonical_boundary(payload))
+        if run.status in {'received', 'running'}:
+            self.env.cr.execute("SELECT clock_timestamp() AT TIME ZONE 'UTC'")
+            run._set_execution_values({'canonical_polled_at': self.env.cr.fetchone()[0]})
+        return True
 
     def write(self, vals):
         if set(vals) - {"name"}:
@@ -885,6 +1017,17 @@ class FacodiPipelineRun(models.Model):
         if enabled.lower() not in ("true", "1"):
             return False
         self._reconcile_processing_receipts()
+        canonical_processed = False
+        canonical = self.env['ir.config_parameter'].sudo().get_param('facodi_api.canonical_dispatch_enabled', 'false')
+        if canonical.lower() in ('true', '1'):
+            with self.env.registry.cursor() as cursor:
+                environment = api.Environment(cursor, self.env.uid, dict(self.env.context))
+                try:
+                    canonical_processed = environment[self._name]._dispatch_canonical_receipts()
+                    cursor.commit()
+                except Exception:
+                    cursor.rollback()
+                    _logger.error('Canonical dispatch failed code=CANONICAL_BOUNDARY_FAILED', exc_info=False)
         self.env.cr.execute(
             """SELECT id FROM facodi_pipeline_run
                     WHERE status = 'received' AND execution_plane = 'odoo_python'
@@ -894,7 +1037,7 @@ class FacodiPipelineRun(models.Model):
         )
         row_ids = [row[0] for row in self.env.cr.fetchall()]
         if not row_ids:
-            return False
+            return canonical_processed
         runs = self.browse(row_ids)
         for run in runs:
             try:

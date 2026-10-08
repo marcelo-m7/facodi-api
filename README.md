@@ -2,7 +2,7 @@
 
 This repository owns FACODI technical processing: ingestion, normalization, enrichment, jobs, checkpoints and proposed matching. Its Python core is independent of Odoo and Learning. The Odoo facade and HTTP transport share authorized commands; Learning owns editorial results, courses, content, review and publication. Supabase and Stripe bridges remain separate integrations.
 
-## INC-P2 Intake Candidate
+## INC-P2 Bounded Text Candidate
 
 Version `19.0.3.4.0` introduces the first disabled-by-default cutover slice,
 not a complete Supabase executor. The independent `facodi_project` addon remains
@@ -17,11 +17,28 @@ executor and human work; the old cron/commands cannot process canonical jobs.
 Old runs are not adopted or backfilled. Missing or inaccessible workspaces fail
 closed, without per-run fallback Projects or mandatory technical subtasks.
 
-Do not enable this candidate in production: recoverable Supabase dispatch,
-authenticated monotonic receipts, Learning consumer cutover and full provider
-recovery/remote acceptance are still required. Source test success is not runtime
-image identity or proof that analysis has completed. Owner CI runs pure tests,
-native Project and API suites, real Project concurrency and repeated upgrades.
+The candidate now freezes a minimal dispatch payload and polls authenticated,
+identity-scoped monotonic receipts. `facodi_api.canonical_dispatch_enabled`
+defaults to false. Its scheduler uses a separate transaction: uncommitted intake
+never reaches the network. Lost acceptance responses replay the native task key
+and bind the same external job UUID. Unchanged polls cannot starve later jobs;
+terminal projection has only one local revision. Human task fields are untouched.
+
+The first cohort supports explicit manual/Markdown text and explicit YouTube
+transcripts up to 12000 UTF-8 bytes. Unsupported sources fail before intake; no
+content is silently truncated or acquired. The frozen baseline/Gemini provider
+is preserved, never replaced by the semantically different v3 metadata fallback.
+The server-only target is the approved FACODI Supabase project and modern secret.
+Legacy providers, binary documents and old accepted runs retain their old route
+when canonical intake is disabled.
+
+Forty-two native API security tests passed locally. The deployment harness also
+proves one unpublished native Learning result/attempt and idempotent replay.
+Do not enable this candidate in production: worker scheduling, all-source and
+catalog-mapping parity, versioned retry/cancel/input, final integrated acceptance
+and productive target/image/canary proof remain required. Source test success is
+not runtime image identity. Owner CI retains native Project/API gates, real
+Project concurrency and repeated upgrades.
 
 ## Structure
 
