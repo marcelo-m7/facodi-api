@@ -11,5 +11,55 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install 'pytest>=8,<10' -r requirements.txt
-      - run: python -m pytest -q
-      - run: python -m compileall -q facodi_api
+      - run: python -m pytest -q tests facodi_api/tests
+      - run: python -m compileall -q facodi_api facodi_project
+  project-native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: odoo:19.0@sha256:dd9013e669caaa23d26765dc55814655eaeecca7cfc2c265dbabae913bce22fd
+      options: --user root
+    services:
+      postgres:
+        image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
+        env:
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: facodi-project-ci-only
+        options: --health-cmd "pg_isready -U odoo" --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      PGHOST: postgres
+      PGUSER: odoo
+      PGPASSWORD: facodi-project-ci-only
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Capture native history before installing the addon
+        run: |
+          odoo --db_host=postgres --db_user=odoo --db_password="$PGPASSWORD" --database=facodi_project_ci --addons-path="/usr/lib/python3/dist-packages/odoo/addons,$GITHUB_WORKSPACE" --init=project --without-demo=true --stop-after-init --no-http --workers=0 --max-cron-threads=0
+          odoo shell --db_host=postgres --db_user=odoo --db_password="$PGPASSWORD" --database=facodi_project_ci --addons-path="/usr/lib/python3/dist-packages/odoo/addons,$GITHUB_WORKSPACE" --no-http <<'PY'
+          import os
+          from pathlib import Path
+          exec(Path(os.environ['GITHUB_WORKSPACE'], 'facodi_project/tests/test_preservation.py').read_text())
+          capture_history(env)
+          PY
+      - name: Native Project install and security suite
+        run: |
+          odoo --db_host=postgres --db_user=odoo --db_password="$PGPASSWORD" --database=facodi_project_ci --addons-path="/usr/lib/python3/dist-packages/odoo/addons,$GITHUB_WORKSPACE" --init=facodi_project --without-demo=true --test-enable --test-tags=/facodi_project --stop-after-init --no-http --workers=0 --max-cron-threads=0 2>&1 | tee /tmp/project-native.log
+          grep -Eq 'odoo.tests.result: 0 failed, 0 error\(s\) of [1-9][0-9]* tests' /tmp/project-native.log
+      - name: Real independent-process concurrency and archived replay
+        run: |
+          odoo shell --db_host=postgres --db_user=odoo --db_password="$PGPASSWORD" --database=facodi_project_ci --addons-path="/usr/lib/python3/dist-packages/odoo/addons,$GITHUB_WORKSPACE" --no-http <<'PY'
+          from odoo.addons.facodi_project.tests.test_concurrency import run_concurrency
+          run_concurrency(env)
+          PY
+      - name: Two consecutive upgrades
+        run: |
+          for upgrade in 1 2; do
+            odoo --db_host=postgres --db_user=odoo --db_password="$PGPASSWORD" --database=facodi_project_ci --addons-path="/usr/lib/python3/dist-packages/odoo/addons,$GITHUB_WORKSPACE" --update=facodi_project --without-demo=true --stop-after-init --no-http --workers=0 --max-cron-threads=0
+          done
+          odoo shell --db_host=postgres --db_user=odoo --db_password="$PGPASSWORD" --database=facodi_project_ci --addons-path="/usr/lib/python3/dist-packages/odoo/addons,$GITHUB_WORKSPACE" --no-http <<'PY'
+          from odoo.addons.facodi_project.tests.test_preservation import verify_history
+          verify_history(env)
+          PY
