@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import uuid
+import requests
 from html import escape
 
 from odoo import api, fields, models, tools
@@ -100,6 +101,17 @@ class FacodiPipelineRun(models.Model):
 
     project_id = fields.Many2one("project.project", string="Project", ondelete="set null")
     task_id = fields.Many2one("project.task", string="Project Task", ondelete="set null")
+    execution_plane = fields.Selection(
+        [("odoo_python", "Legacy Odoo Python"), ("supabase", "Canonical Supabase")],
+        required=True, default="odoo_python", readonly=True, copy=False, index=True,
+    )
+    canonical_payload_json = fields.Text(readonly=True, copy=False)
+    canonical_job_id = fields.Char(readonly=True, copy=False, index=True)
+    canonical_receipt_revision = fields.Integer(readonly=True, default=0, copy=False)
+    canonical_receipt_json = fields.Text(readonly=True, copy=False)
+    canonical_polled_at = fields.Datetime(readonly=True, copy=False)
+    canonical_command_json = fields.Text(readonly=True, copy=False)
+    canonical_command_revision = fields.Integer(readonly=True, default=0, copy=False)
     target_channel_id = fields.Many2one("slide.channel", string="Publication Course", index=True, ondelete="restrict")
     published_slide_id = fields.Many2one("slide.slide", string="Published Content", readonly=True, copy=False, ondelete="restrict")
     reviewed_by_id = fields.Many2one("res.users", string="Reviewed By", readonly=True, copy=False)
@@ -340,6 +352,10 @@ class FacodiPipelineRun(models.Model):
 
     @api.model
     def submit(self, values):
+        return self._submit_accepted(values)
+
+    @api.model
+    def _submit_accepted(self, values, *, predecessor=None):
         """Authorized async command used by HTTP and in-process adapters.
 
         The dedicated cursor observes committed intake even when the caller's
@@ -393,7 +409,8 @@ class FacodiPipelineRun(models.Model):
                     "status": status, "revision": revision, "created": False,
                     "created_at": created_at.isoformat() if created_at else None}
         try:
-            return self.create(values)._submission_receipt(True)
+            run = self._create_accepted([values], predecessor=predecessor) if predecessor else self.create(values)
+            return run._submission_receipt(True)
         except Exception:
             lock.release()
             raise
@@ -421,6 +438,10 @@ class FacodiPipelineRun(models.Model):
 
     @api.model_create_multi
     def create(self, vals_list):
+        return self._create_accepted(vals_list)
+
+    @api.model
+    def _create_accepted(self, vals_list, *, predecessor=None):
         self._check_pipeline_enabled()
         self.check_access("create")
         prepared = []
@@ -428,12 +449,25 @@ class FacodiPipelineRun(models.Model):
             vals = self._normalize_submission(values)
             channel = self.env["slide.channel"].browse(vals["target_channel_id"])
             self._authorize_channel(channel, self.env.company)
+            if predecessor:
+                predecessor.ensure_one()
+                predecessor.check_access('write')
+                if (predecessor.execution_plane != 'supabase' or predecessor.status != 'waiting_input'
+                        or predecessor.company_id != self.env.company or predecessor.target_channel_id != channel):
+                    raise AccessError('Input revisions require the accepted canonical predecessor scope.')
+                workspace = predecessor.project_id
+                self.env['project.task']._facodi_check_workspace(workspace)
+            else:
+                workspace = self._canonical_workspace(channel.website_id)
             vals.update({
                 "run_id": str(uuid.uuid4()), "owner_id": self.env.user.id,
                 "company_id": self.env.company.id, "website_id": channel.website_id.id,
                 "request_hash": self._submission_fingerprint(vals), "status": "received",
                 "name": vals["name"] or vals["title"] or "Content intake",
+                "execution_plane": "supabase" if workspace else "odoo_python",
             })
+            if workspace:
+                vals["project_id"] = workspace.id
             if vals['attachment_id']:
                 _content, digest, filename = self._attachment_details(vals['attachment_id'], channel.id)
                 vals.update(attachment_digest=digest, attachment_name_snapshot=filename)
@@ -441,8 +475,12 @@ class FacodiPipelineRun(models.Model):
                 slide = self._authorize_existing_slide(vals['existing_slide_id'], channel.id)
                 self._validate_existing_slide_source(slide, vals)
                 vals['existing_slide_hash'] = self._canonical_source_hash(slide)
-            vals['provider_config_json'] = json.dumps(self._server_provider_configuration(), sort_keys=True)
-            vals['catalog_snapshot_json'] = json.dumps(self._build_catalog_snapshot(channel).to_dict(), ensure_ascii=False)
+            vals['provider_config_json'] = (predecessor.provider_config_json if predecessor else
+                                           json.dumps(self._server_provider_configuration(), sort_keys=True))
+            vals['catalog_snapshot_json'] = (predecessor.catalog_snapshot_json if predecessor else
+                                            json.dumps(self._build_catalog_snapshot(channel).to_dict(), ensure_ascii=False))
+            if workspace:
+                vals['canonical_payload_json'] = json.dumps(self._canonical_request(vals), sort_keys=True, allow_nan=False)
             prepared.append(vals)
         clean_context = {key: value for key, value in self.env.context.items() if not key.startswith("default_")}
         trusted_model = self.with_context(clean_context)
@@ -450,6 +488,233 @@ class FacodiPipelineRun(models.Model):
         for run in runs:
             run._ensure_project_task()
         return runs
+
+    @api.model
+    def _canonical_workspace(self, website):
+        parameters = self.env["ir.config_parameter"].sudo()
+        enabled = parameters.get_param("facodi_api.canonical_intake_enabled", "false")
+        if enabled.lower() not in ("true", "1"):
+            return self.env["project.project"]
+        value = parameters.get_param("facodi_api.canonical_workspace.%s" % website.id, "")
+        if not isinstance(value, str) or not value.isdecimal() or int(value) <= 0:
+            raise UserError("Configure an explicit managed workspace for this Website.")
+        workspace = self.env["project.project"].browse(int(value)).exists()
+        self.env["project.task"]._facodi_check_workspace(workspace)
+        if workspace.company_id != website.company_id:
+            raise AccessError("The managed workspace must belong to the Website company.")
+        return workspace
+
+    @api.model
+    def _canonical_request(self, values):
+        automatic_transcript = (values['source_type'] == 'youtube' and not values['is_manual_transcript']
+                                and not values['raw_content'].strip())
+        if (values['source_type'] not in {'manual', 'markdown', 'youtube'}
+                or values['attachment_id'] or (not values['raw_content'].strip() and not automatic_transcript)
+                or (values['source_type'] == 'youtube' and not values['is_manual_transcript'] and not automatic_transcript)
+                or len(values['raw_content'].encode('utf-8')) > 12000):
+            raise UserError('The canonical cohort requires bounded text or a frozen automatic transcript acquisition; no source is truncated.')
+        request = {name: values[name] for name in ('source_type', 'source_url', 'title', 'raw_content', 'language')}
+        if automatic_transcript:
+            request['acquisition_config'] = {'provider': 'youtube-transcript-plus', 'version': '2.0.3'}
+        if values['source_type'] != 'youtube' and values['source_url']:
+            raise UserError('The canonical text cohort does not acquire external document URLs.')
+        request['provider_config'] = json.loads(values['provider_config_json'])
+        request['catalog_snapshot'] = json.loads(values['catalog_snapshot_json'])
+        if len(json.dumps(request, allow_nan=False).encode('utf-8')) > 60000:
+            raise UserError('The accepted canonical request exceeds the transport budget.')
+        return request
+
+    def _call_canonical_boundary(self, payload):
+        self.ensure_one()
+        host = (os.environ.get('SUPABASE_URL') or '').rstrip('/')
+        secret = (os.environ.get('SUPABASE_SECRET_KEY') or '').strip()
+        if host != 'https://bhfywztfyidvrlarebmg.supabase.co' or not secret.startswith('sb_secret_'):
+            raise UserError('The approved canonical service target and secret credential are required.')
+        with requests.Session() as session:
+            session.trust_env = False
+            with session.post(host + '/functions/v1/v4_canonical_analysis',
+                              json=payload, headers={'apikey': secret}, timeout=(5, 15),
+                              allow_redirects=False, stream=True) as response:
+                if response.status_code not in (200, 202):
+                    raise UserError('CANONICAL_BOUNDARY_UNAVAILABLE')
+                parts, size = [], 0
+                for part in response.iter_content(chunk_size=8192):
+                    size += len(part)
+                    if size > 65536:
+                        raise UserError('CANONICAL_RECEIPT_TOO_LARGE')
+                    parts.append(part)
+                try:
+                    result = json.loads(b''.join(parts), parse_constant=lambda value: (_ for _ in ()).throw(ValueError()))
+                    if payload['action'] in {'cancel', 'retry'}:
+                        if not isinstance(result, dict) or not isinstance(result['receipt'], dict):
+                            raise ValueError()
+                        return result
+                    return result['receipt']
+                except (KeyError, TypeError, ValueError):
+                    raise UserError('INVALID_CANONICAL_RECEIPT') from None
+
+    def _apply_canonical_receipt(self, receipt):
+        self.ensure_one()
+        self.check_access('write')
+        if self.execution_plane != 'supabase' or self.env.company != self.company_id:
+            raise AccessError('The accepted canonical execution scope is required.')
+        self._authorize_channel(self.target_channel_id, self.company_id, self.website_id)
+        self.env.cr.execute('SELECT id FROM facodi_pipeline_run WHERE id = %s FOR UPDATE', [self.id])
+        self.invalidate_recordset()
+        try:
+            job_id = receipt['job_id']
+            if not isinstance(job_id, str) or str(uuid.UUID(job_id)) != job_id:
+                raise ValueError()
+            if (receipt['task_ref'] != self.task_id.facodi_ref or receipt['company_id'] != self.company_id.id
+                    or receipt['cohort'] != 'p2' or type(receipt['revision']) is not int or receipt['revision'] <= 0
+                    or type(receipt['attempt']) is not int or not 0 <= receipt['attempt'] <= 20
+                    or receipt['status'] not in {'queued', 'processing', 'needs_review', 'failed', 'cancelled'}
+                    or not isinstance(receipt['result'], dict)):
+                raise ValueError()
+            encoded = json.dumps(receipt, sort_keys=True, ensure_ascii=False, allow_nan=False)
+            if len(encoded.encode('utf-8')) > 65536:
+                raise ValueError()
+        except (KeyError, TypeError, ValueError):
+            raise ValidationError('INVALID_CANONICAL_RECEIPT') from None
+        if self.canonical_job_id and self.canonical_job_id != job_id:
+            raise ValidationError('CANONICAL_IDENTITY_CONFLICT')
+        if receipt['revision'] < self.canonical_receipt_revision:
+            return False
+        if receipt['revision'] == self.canonical_receipt_revision:
+            saved = json.dumps(json.loads(self.canonical_receipt_json), sort_keys=True, ensure_ascii=False, allow_nan=False)
+            if encoded != saved:
+                raise ValidationError('CANONICAL_REVISION_CONFLICT')
+            return False
+        if receipt['attempt'] < self.attempt_count:
+            raise ValidationError('CANONICAL_ATTEMPT_CONFLICT')
+        cancelling = self.status == 'cancelled' and bool(self.canonical_command_json)
+        if self.status not in {'received', 'running'} and not cancelling:
+            raise ValidationError('CANONICAL_TERMINAL_CONFLICT')
+        values = {'canonical_job_id': job_id, 'canonical_receipt_revision': receipt['revision'],
+                  'canonical_receipt_json': encoded, 'attempt_count': receipt['attempt']}
+        if receipt['status'] == 'cancelled' and not cancelling:
+            raise ValidationError('CANONICAL_COMMAND_CONFLICT')
+        if cancelling:
+            self.task_id.facodi_bind_receipt(job_id)
+            self._set_execution_values(values)
+            return True
+        if receipt['status'] == 'needs_review':
+            result = receipt['result']
+            source, enriched = result.get('document_data', {}), result.get('enriched_data', {})
+            accepted = json.loads(self.provider_config_json)
+            provider = 'baseline-deterministic' if accepted['provider'] == 'baseline' else 'gemini-structured'
+            model = accepted['version'] if accepted['provider'] == 'baseline' else accepted['model']
+            request = json.loads(self.canonical_payload_json)
+            acquisition = request.get('acquisition_config')
+            source_conflict = not isinstance(source, dict) or source.get('text_content') != self.raw_content
+            if acquisition:
+                metadata = result.get('metadata', {})
+                document = metadata.get('document_data', {}) if isinstance(metadata, dict) else {}
+                text = source.get('text_content') if isinstance(source, dict) else None
+                source_conflict = (not isinstance(text, str) or not text.strip() or len(text.encode('utf-8')) > 12000
+                                   or not isinstance(document, dict) or document.get('text_content') != text
+                                   or document.get('language') != self.language
+                                   or document.get('source_url') != self.source_url
+                                   or document.get('extraction_provider') != acquisition['provider']
+                                   or document.get('extraction_version') != acquisition['version'])
+            if (not isinstance(source, dict) or not isinstance(enriched, dict)
+                    or source_conflict or source.get('language') != self.language
+                    or not isinstance(enriched.get('summary'), str) or not enriched['summary'].strip()
+                    or enriched.get('provider_name') != provider or enriched.get('model_name') != model
+                    or not isinstance(result.get('chunks'), list)):
+                raise ValidationError('CANONICAL_RESULT_CONFLICT')
+            catalog = request.get('catalog_snapshot')
+            if catalog:
+                mapping = result.get('mapping_data', {})
+                if (not isinstance(mapping, dict) or mapping.get('snapshot_id') != catalog['snapshot_id']
+                        or mapping.get('snapshot_hash') != catalog['snapshot_hash']
+                        or mapping.get('ranking_algorithm_version') != 'deterministic-v2'
+                        or not isinstance(enriched.get('id'), str)
+                        or mapping.get('enriched_document_id') != enriched['id']
+                        or not isinstance(mapping.get('candidates'), list) or len(mapping['candidates']) > 5
+                        or not isinstance(mapping.get('unmatched_concepts'), list)
+                        or any(not isinstance(name, str) for name in mapping['unmatched_concepts'])):
+                    raise ValidationError('CANONICAL_MAPPING_CONFLICT')
+                targets = {target['id']: target for target in catalog['targets']}
+                seen = set()
+                for candidate in mapping['candidates']:
+                    if not isinstance(candidate, dict) or not isinstance(candidate.get('target_id'), str):
+                        raise ValidationError('CANONICAL_MAPPING_CONFLICT')
+                    target = targets.get(candidate['target_id'])
+                    if (not target or candidate['target_id'] in seen
+                            or candidate.get('target_name') != target['name'] or candidate.get('target_type') != target['type']
+                            or candidate.get('relation') != 'matches_course'
+                            or type(candidate.get('score')) not in (int, float) or not 0.25 <= candidate['score'] <= 1
+                            or type(candidate.get('confidence')) not in (int, float) or candidate['confidence'] != candidate['score']
+                            or not isinstance(candidate.get('justification'), str)
+                            or not isinstance(candidate.get('evidence'), list)
+                            or not isinstance(candidate.get('matched_concepts'), list)
+                            or any(not isinstance(term, str) for term in candidate['evidence'] + candidate['matched_concepts'])):
+                        raise ValidationError('CANONICAL_MAPPING_CONFLICT')
+                    seen.add(candidate['target_id'])
+            values.update(status='waiting_review', metadata_json=json.dumps(result, ensure_ascii=False),
+                          concepts_count=len(enriched.get('concepts', [])), chunks_count=len(result['chunks']),
+                          error_message=False)
+        elif receipt['status'] == 'failed':
+            code = receipt['result'].get('error_code')
+            state = failure_status(code) if isinstance(code, str) else 'failed'
+            values.update(status=state, error_message=code if state == 'waiting_input' else 'CANONICAL_PROCESSING_FAILED')
+        elif receipt['status'] == 'processing':
+            values.update(status='running')
+        self.task_id.facodi_bind_receipt(job_id)
+        self._set_execution_values(values)
+        if receipt['status'] == 'failed':
+            self.task_id.activity_schedule('mail.mail_activity_data_todo',
+                                          user_id=self.target_channel_id.user_id.id or self.owner_id.id,
+                                          summary='Canonical processing requires review')
+        if receipt['status'] in {'needs_review', 'failed'}:
+            self._on_processing_complete()
+        return True
+
+    @api.model
+    def _dispatch_canonical_receipts(self):
+        self.flush_model(['execution_plane', 'status', 'canonical_polled_at', 'canonical_command_json'])
+        self.env.cr.execute("""SELECT id FROM facodi_pipeline_run
+            WHERE execution_plane = 'supabase' AND
+                (status IN ('received', 'running') OR canonical_command_json IS NOT NULL)
+            ORDER BY canonical_polled_at NULLS FIRST, id LIMIT 1 FOR UPDATE SKIP LOCKED""")
+        row = self.env.cr.fetchone()
+        if not row:
+            return False
+        run = self.browse(row[0])
+        run = run.with_user(run.owner_id).with_context(allowed_company_ids=[run.company_id.id]).with_company(run.company_id)
+        run.check_access('write')
+        run._authorize_channel(run.target_channel_id, run.company_id, run.website_id)
+        payload = {'task_ref': run.task_id.facodi_ref, 'company_id': run.company_id.id, 'cohort': 'p2'}
+        if run.canonical_command_json:
+            command = json.loads(run.canonical_command_json)
+            if not run.canonical_job_id:
+                run._apply_canonical_receipt(run._call_canonical_boundary(dict(
+                    payload, action='submit', request=json.loads(run.canonical_payload_json))))
+            response = run._call_canonical_boundary(dict(payload, job_id=run.canonical_job_id, **command))
+            expected_status = 'cancelled' if command['action'] == 'cancel' else 'queued'
+            if (not isinstance(response, dict) or response.get('command_id') != command['command_id']
+                    or type(response.get('command_revision')) is not int
+                    or response['command_revision'] != command['expected_revision'] + 1
+                    or not isinstance(response.get('receipt'), dict)
+                    or response['receipt'].get('status') != expected_status
+                    or type(response['receipt'].get('revision')) is not int
+                    or response['receipt']['revision'] <= run.canonical_receipt_revision):
+                raise ValidationError('CANONICAL_COMMAND_CONFLICT')
+            run._apply_canonical_receipt(response['receipt'])
+            run._set_execution_values({'canonical_command_json': False,
+                                       'canonical_command_revision': response['command_revision']})
+            run._on_processing_complete()
+            return True
+        if run.canonical_job_id:
+            payload.update(action='receipt', job_id=run.canonical_job_id)
+        else:
+            payload.update(action='submit', request=json.loads(run.canonical_payload_json))
+        run._apply_canonical_receipt(run._call_canonical_boundary(payload))
+        if run.status in {'received', 'running'}:
+            self.env.cr.execute("SELECT clock_timestamp() AT TIME ZONE 'UTC'")
+            run._set_execution_values({'canonical_polled_at': self.env.cr.fetchone()[0]})
+        return True
 
     def write(self, vals):
         if set(vals) - {"name"}:
@@ -475,7 +740,7 @@ class FacodiPipelineRun(models.Model):
             vals.update(revision=self.revision + 1, history_json=json.dumps(history))
         return super().write(vals)
 
-    def _lock_command(self):
+    def _lock_command(self, *, allow_canonical=False):
         self.ensure_one()
         self._check_pipeline_enabled()
         self.check_access("write")
@@ -486,19 +751,36 @@ class FacodiPipelineRun(models.Model):
         if self.legacy_quarantined or self.env.company != self.company_id:
             raise AccessError("Commands require a verified run in its recorded company.")
         self._authorize_channel(self.target_channel_id, self.company_id, self.website_id)
+        if self.execution_plane == "supabase" and not allow_canonical:
+            raise UserError("Canonical execution commands require the Supabase boundary.")
 
     def _apply_command(self, command, expected_revision):
-        self._lock_command()
+        self._lock_command(allow_canonical=command in {'cancel', 'retry'})
         if type(expected_revision) is not int or expected_revision < 0:
             raise InvalidTransition("A nonnegative expected_revision is required.")
         # Replay identifies the exact already-applied command, never a fresh retry.
         if any(event.get("command") == command and event.get("from_revision") == expected_revision
                for event in json.loads(self.history_json or "[]")):
             return True
-        state = command_transition(self.status, command, self.revision, expected_revision)
+        if self.execution_plane == 'supabase' and self.canonical_command_json:
+            raise RevisionConflict('A canonical command is awaiting acknowledgment.')
+        if self.execution_plane == 'supabase' and command == 'cancel' and self.status == 'running':
+            if self.revision != expected_revision:
+                raise RevisionConflict('Run changed before cancellation was requested.')
+            state = 'cancelled'
+        else:
+            state = command_transition(self.status, command, self.revision, expected_revision)
         if command == "retry" and self.attempt_count >= 20:
             raise InvalidTransition("Attempt budget exhausted; submit a reviewed new request.")
-        self._record_transition({"status": state, "error_message": False}, command=command)
+        values = {"status": state, "error_message": False}
+        if self.execution_plane == 'supabase':
+            values['canonical_command_json'] = json.dumps({
+                'action': command, 'command_id': str(uuid.uuid4()),
+                'expected_revision': self.canonical_command_revision,
+            }, sort_keys=True)
+        self._record_transition(values, command=command)
+        if self.execution_plane == 'supabase':
+            self._on_processing_complete()
         return True
 
     def action_retry(self, expected_revision=None):
@@ -530,7 +812,7 @@ class FacodiPipelineRun(models.Model):
 
     def action_supply_transcript(self, raw_content, idempotency_key, expected_revision=None):
         """Create an explicit input revision; never replace the accepted source."""
-        self._lock_command()
+        self._lock_command(allow_canonical=True)
         if type(expected_revision) is not int or expected_revision < 0:
             raise InvalidTransition("A nonnegative expected_revision is required.")
         if self.source_type != "youtube":
@@ -557,20 +839,38 @@ class FacodiPipelineRun(models.Model):
             raise RevisionConflict("Run changed before new input was supplied.")
         if self.status != "waiting_input":
             raise InvalidTransition("Only a run waiting for input accepts a new transcript revision.")
+        if self.execution_plane == 'supabase' and self.canonical_command_json:
+            raise RevisionConflict('A canonical command is awaiting acknowledgment.')
         with self.env.cr.savepoint():
-            receipt = self.submit(values)
+            receipt = (self._submit_accepted(values, predecessor=self) if self.execution_plane == 'supabase'
+                       else self.submit(values))
             child = self.browse(receipt["id"])
             if not receipt["created"]:
                 raise SubmissionConflict("Input revision key already belongs to another request.")
             child._set_execution_values({"input_parent_id": self.id})
-            self._record_transition({"status": "cancelled", "error_message": "SUPERSEDED_BY_INPUT"}, command="input")
+            self._on_input_revision_accepted(child)
+            values = {"status": "cancelled", "error_message": "SUPERSEDED_BY_INPUT"}
+            if self.execution_plane == 'supabase':
+                values['canonical_command_json'] = json.dumps({
+                    'action': 'cancel', 'command_id': str(uuid.uuid4()),
+                    'expected_revision': self.canonical_command_revision,
+                }, sort_keys=True)
+            self._record_transition(values, command="input")
+            if self.execution_plane == 'supabase':
+                self._on_processing_complete()
         return child
+
+    def _on_input_revision_accepted(self, child):
+        """Editorial extension point for an accepted immutable source revision."""
+        return True
 
     def action_execute_pipeline(self):
         """Execute the pure Python pipeline runner and update record state."""
         self.ensure_one()
         self._check_pipeline_enabled()
         self.check_access("write")
+        if self.execution_plane == "supabase":
+            raise UserError("Canonical executions cannot use the legacy Odoo executor.")
         self.env.cr.execute("SELECT id FROM facodi_pipeline_run WHERE id = %s FOR UPDATE SKIP LOCKED", [self.id])
         if not self.env.cr.fetchone():
             return False
@@ -629,6 +929,8 @@ class FacodiPipelineRun(models.Model):
     def _sync_to_project_task(self):
         """Create or update a mirrored task in project.project / project.task."""
         self.ensure_one()
+        if self.execution_plane == "supabase":
+            return False
         if "project.task" not in self.env:
             return
 
@@ -659,6 +961,20 @@ class FacodiPipelineRun(models.Model):
     def _ensure_project_task(self):
         """Create private review work as soon as a run is accepted."""
         self.ensure_one()
+        if self.execution_plane == "supabase":
+            if not self.project_id:
+                raise UserError("Canonical execution requires its accepted managed workspace.")
+            receipt = self.env["project.task"].facodi_ensure_task(
+                self.project_id.id,
+                self.title or self.name,
+                idempotency_key="api-run:%s" % self.run_id,
+                kind="execution", origin="api",
+            )
+            if self.task_id and self.task_id.id != receipt["id"]:
+                raise ValidationError("Canonical task identity conflicts with the accepted execution.")
+            if not self.task_id:
+                self._set_execution_values({"task_id": receipt["id"]})
+            return
         if self.project_id and self.task_id:
             return
 
@@ -842,16 +1158,27 @@ class FacodiPipelineRun(models.Model):
         if enabled.lower() not in ("true", "1"):
             return False
         self._reconcile_processing_receipts()
+        canonical_processed = False
+        canonical = self.env['ir.config_parameter'].sudo().get_param('facodi_api.canonical_dispatch_enabled', 'false')
+        if canonical.lower() in ('true', '1'):
+            with self.env.registry.cursor() as cursor:
+                environment = api.Environment(cursor, self.env.uid, dict(self.env.context))
+                try:
+                    canonical_processed = environment[self._name]._dispatch_canonical_receipts()
+                    cursor.commit()
+                except Exception:
+                    cursor.rollback()
+                    _logger.error('Canonical dispatch failed code=CANONICAL_BOUNDARY_FAILED', exc_info=False)
         self.env.cr.execute(
             """SELECT id FROM facodi_pipeline_run
-               WHERE status = 'received'
+                    WHERE status = 'received' AND execution_plane = 'odoo_python'
                ORDER BY id
                LIMIT 1
                FOR UPDATE SKIP LOCKED"""
         )
         row_ids = [row[0] for row in self.env.cr.fetchall()]
         if not row_ids:
-            return False
+            return canonical_processed
         runs = self.browse(row_ids)
         for run in runs:
             try:

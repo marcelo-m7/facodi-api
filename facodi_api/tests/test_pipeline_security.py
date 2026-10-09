@@ -1,6 +1,8 @@
 """Exercise ORM boundaries in the real Odoo registry (not source-text assertions)."""
 import importlib.util
 import unittest
+import json
+from uuid import uuid4
 from unittest.mock import patch
 
 if importlib.util.find_spec("odoo") is None:
@@ -9,6 +11,7 @@ if importlib.util.find_spec("odoo") is None:
 from odoo.fields import Command
 from odoo.exceptions import AccessError, UserError, ValidationError
 from odoo.tests import TransactionCase, tagged
+from ..core.contracts.lifecycle import InvalidTransition, RevisionConflict
 
 
 @tagged('post_install', '-at_install')
@@ -30,6 +33,484 @@ class TestPipelineSecurity(TransactionCase):
     def values(self, key='security'):
         return {'source_type': 'manual', 'raw_content': 'A real reviewable paragraph.',
                 'idempotency_key': key, 'target_channel_id': self.channel.id}
+
+    def canonical_workspace(self):
+        workspace = self.env['project.project'].create({
+            'name': 'Permanent content workspace', 'facodi_managed': True,
+            'company_id': self.env.company.id, 'privacy_visibility': 'employees',
+        })
+        parameters = self.env['ir.config_parameter'].sudo()
+        parameters.set_param('facodi_api.canonical_intake_enabled', 'true')
+        parameters.set_param('facodi_api.canonical_workspace.%s' % self.channel.website_id.id, workspace.id)
+        return workspace
+
+    def test_canonical_intake_replay_preserves_route_and_human_task(self):
+        workspace = self.canonical_workspace()
+        projects_before = self.env['project.project'].search_count([])
+        tasks_before = self.env['project.task'].search_count([])
+        first = self.Run.submit(self.values('canonical'))
+        run = self.Run.browse(first['id'])
+        self.assertEqual(run.execution_plane, 'supabase')
+        self.assertEqual(run.project_id, workspace)
+        self.assertTrue(run.task_id.facodi_ref)
+        run.task_id.write({'name': 'Human decision', 'description': 'Keep authored work'})
+        self.env['ir.config_parameter'].sudo().set_param('facodi_api.canonical_intake_enabled', 'false')
+        replay = self.Run.submit(self.values('canonical'))
+        self.assertEqual(replay['id'], first['id'])
+        run._ensure_project_task()
+        run._sync_to_project_task()
+        self.assertEqual(run.execution_plane, 'supabase')
+        self.assertEqual(run.task_id.name, 'Human decision')
+        self.assertEqual(run.task_id.description, '<p>Keep authored work</p>')
+        self.assertEqual(self.env['project.project'].search_count([]), projects_before)
+        self.assertEqual(self.env['project.task'].search_count([]), tasks_before + 1)
+        self.assertFalse(run.task_id.child_ids)
+
+    def test_canonical_intake_requires_workspace_without_partial_effects(self):
+        self.env['ir.config_parameter'].sudo().set_param('facodi_api.canonical_intake_enabled', 'true')
+        before = self.env['facodi.pipeline.run'].search_count([])
+        projects_before = self.env['project.project'].search_count([])
+        with self.assertRaises(UserError), self.env.cr.savepoint():
+            self.Run.submit(self.values('missing-workspace'))
+        self.assertEqual(self.env['facodi.pipeline.run'].search_count([]), before)
+        self.assertEqual(self.env['project.project'].search_count([]), projects_before)
+
+    def test_canonical_execution_is_never_claimed_by_legacy_worker(self):
+        self.canonical_workspace()
+        run = self.Run.browse(self.Run.submit(self.values('canonical-worker'))['id'])
+        with self.assertRaises(UserError):
+            run.action_execute_pipeline()
+        self.assertFalse(self.env['facodi.pipeline.run'].cron_process_received_runs())
+        self.assertEqual(run.status, 'received')
+        self.assertEqual(run.attempt_count, 0)
+
+    def test_existing_legacy_intake_is_not_adopted_after_route_enablement(self):
+        first = self.Run.submit(self.values('legacy-route'))
+        run = self.Run.browse(first['id'])
+        original_project = run.project_id
+        original_task = run.task_id
+        self.canonical_workspace()
+        replay = self.Run.submit(self.values('legacy-route'))
+        self.assertEqual(replay['id'], first['id'])
+        self.assertEqual(run.execution_plane, 'odoo_python')
+        self.assertEqual(run.project_id, original_project)
+        self.assertEqual(run.task_id, original_task)
+        self.assertFalse(original_project.facodi_managed)
+        self.assertFalse(original_task.facodi_ref)
+
+    def test_canonical_executor_cannot_be_forged_or_replaced(self):
+        self.canonical_workspace()
+        with self.assertRaises(AccessError):
+            self.Run.create(dict(self.values('forged-plane'), execution_plane='odoo_python'))
+        run = self.Run.with_context(default_execution_plane='odoo_python').create(self.values('frozen-plane'))
+        self.assertEqual(run.execution_plane, 'supabase')
+        with self.assertRaises(AccessError):
+            run.with_context(facodi_pipeline_internal=True).write({'execution_plane': 'odoo_python'})
+        with self.assertRaises(InvalidTransition):
+            run.action_retry(expected_revision=run.revision)
+        self.assertEqual(run.status, 'received')
+
+    def test_canonical_retry_accepts_one_intent_and_keeps_task_input_and_attempt_history(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-retry'))
+        failed = self.canonical_receipt(run, status='failed', revision=2, attempt=1,
+                                        result={'error_code': 'PROVIDER_FAILED'})
+        run._apply_canonical_receipt(failed)
+        expected = run.revision
+        original = (run.task_id, run.canonical_payload_json, run.provider_config_json, run.raw_content)
+        with patch.object(type(self.Run), '_call_canonical_boundary', side_effect=AssertionError('No network before commit')):
+            self.assertTrue(run.action_retry(expected_revision=expected))
+            intent = run.canonical_command_json
+            self.assertTrue(run.action_retry(expected_revision=expected))
+            self.assertEqual(run.canonical_command_json, intent)
+            with self.assertRaises(RevisionConflict):
+                run.action_cancel(expected_revision=run.revision)
+        self.assertEqual(run.status, 'received')
+        self.assertEqual(run.attempt_count, 1)
+        command = json.loads(intent)
+        queued = dict(failed, revision=3, status='queued', result={})
+        with patch.object(type(self.Run), '_call_canonical_boundary', return_value={
+                'receipt': queued, 'command_id': command['command_id'], 'command_revision': 1}) as boundary:
+            self.assertTrue(self.Run._dispatch_canonical_receipts())
+        self.assertEqual(boundary.call_args[0][0]['action'], 'retry')
+        self.assertEqual(boundary.call_args[0][0]['job_id'], failed['job_id'])
+        self.assertEqual(boundary.call_args[0][0]['expected_revision'], 0)
+        self.assertFalse(run.canonical_command_json)
+        self.assertEqual(run.canonical_command_revision, 1)
+        self.assertTrue(run.action_retry(expected_revision=expected))
+        self.assertFalse(run.canonical_command_json)
+        run._apply_canonical_receipt(dict(failed, revision=4, attempt=2))
+        self.assertEqual(run.attempt_count, 2)
+        run.action_retry(expected_revision=run.revision)
+        next_command = json.loads(run.canonical_command_json)
+        self.assertEqual(next_command['expected_revision'], 1)
+        self.assertNotEqual(next_command['command_id'], command['command_id'])
+        self.assertEqual((run.task_id, run.canonical_payload_json, run.provider_config_json, run.raw_content), original)
+        self.assertEqual(run.canonical_job_id, failed['job_id'])
+        self.assertEqual(run.task_id.facodi_external_ref, failed['job_id'])
+
+    def test_canonical_retry_denies_invalid_ack_without_losing_intent_or_prior_receipt(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-retry-ack'))
+        failed = self.canonical_receipt(run, status='failed', revision=2, attempt=1)
+        run._apply_canonical_receipt(failed)
+        run.action_retry(expected_revision=run.revision)
+        intent, receipt = run.canonical_command_json, run.canonical_receipt_json
+        command = json.loads(intent)
+        response = {'command_id': command['command_id'], 'command_revision': 1,
+                    'receipt': dict(failed, status='queued', revision=3, result={})}
+        for changed in [dict(response, command_id=str(uuid4())), dict(response, command_revision=True),
+                        dict(response, receipt=dict(response['receipt'], status='cancelled')),
+                        dict(response, receipt=dict(response['receipt'], revision=1))]:
+            with patch.object(type(self.Run), '_call_canonical_boundary', return_value=changed):
+                with self.assertRaises(ValidationError):
+                    self.Run._dispatch_canonical_receipts()
+            self.assertEqual(run.canonical_command_json, intent)
+            self.assertEqual(run.canonical_receipt_json, receipt)
+            self.assertEqual(run.canonical_command_revision, 0)
+
+    def test_canonical_retry_cannot_reset_exhausted_lifetime_attempts(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-retry-budget'))
+        run._apply_canonical_receipt(self.canonical_receipt(run, status='failed', revision=2, attempt=20))
+        with self.assertRaises(InvalidTransition):
+            run.action_retry(expected_revision=run.revision)
+        self.assertEqual(run.status, 'failed')
+        self.assertEqual(run.attempt_count, 20)
+        self.assertFalse(run.canonical_command_json)
+
+    def test_canonical_receipt_cannot_regress_or_exceed_lifetime_attempts(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-attempt-monotonicity'))
+        processing = self.canonical_receipt(run, status='processing', revision=2, attempt=2)
+        run._apply_canonical_receipt(processing)
+        saved = run.canonical_receipt_json
+        for attempt in (1, 21):
+            with self.assertRaises(ValidationError):
+                run._apply_canonical_receipt(dict(processing, status='failed', revision=3, attempt=attempt))
+            self.assertEqual(run.canonical_receipt_json, saved)
+            self.assertEqual(run.attempt_count, 2)
+        self.assertFalse(run._apply_canonical_receipt(dict(processing, revision=1, status='queued', attempt=0)))
+        self.assertEqual(run.status, 'running')
+
+    def test_canonical_transcript_revision_preserves_accepted_route_provider_catalog_and_parent(self):
+        workspace = self.canonical_workspace()
+        run = self.Run.create(dict(self.values('canonical-input'), source_type='youtube',
+                                   source_url='https://www.youtube.com/watch?v=4GVbqYFmGBw',
+                                   is_manual_transcript=True))
+        failure = self.canonical_receipt(run, status='failed', revision=2, attempt=1,
+                                         result={'error_code': 'YOUTUBE_LANGUAGE_UNAVAILABLE'})
+        run._apply_canonical_receipt(failure)
+        self.assertEqual(run.status, 'waiting_input')
+        expected = run.revision
+        original = (run.raw_content, run.canonical_payload_json, run.canonical_job_id, run.task_id)
+        params = self.env['ir.config_parameter'].sudo()
+        params.set_param('facodi_api.canonical_intake_enabled', 'false')
+        params.set_param('facodi_api.enrichment_provider', 'invalid-after-acceptance')
+        self.channel.name = 'Human rename after accepted catalog'
+        projects_before = self.env['project.project'].search_count([])
+        tasks_before = self.env['project.task'].search_count([])
+        with patch.object(type(self.Run), '_call_canonical_boundary', side_effect=AssertionError('No network before commit')):
+            child = run.action_supply_transcript('Explicit corrected transcript.', 'canonical-input-child', expected_revision=expected)
+            replay = run.action_supply_transcript('Explicit corrected transcript.', 'canonical-input-child', expected_revision=expected)
+        self.assertEqual(child, replay)
+        self.assertEqual(child.execution_plane, 'supabase')
+        self.assertEqual(child.project_id, workspace)
+        self.assertNotEqual(child.task_id, run.task_id)
+        self.assertNotEqual(child.task_id.facodi_ref, run.task_id.facodi_ref)
+        self.assertFalse(child.task_id.facodi_external_ref)
+        self.assertFalse(child.task_id.parent_id)
+        self.assertEqual(child.input_parent_id, run)
+        self.assertEqual(child.provider_config_json, run.provider_config_json)
+        self.assertEqual(child.catalog_snapshot_json, run.catalog_snapshot_json)
+        self.assertEqual(json.loads(child.canonical_payload_json)['raw_content'], 'Explicit corrected transcript.')
+        self.assertEqual((run.raw_content, run.canonical_payload_json, run.canonical_job_id, run.task_id), original)
+        self.assertEqual(run.status, 'cancelled')
+        self.assertEqual(run.error_message, 'SUPERSEDED_BY_INPUT')
+        self.assertEqual(json.loads(run.history_json)[-1]['command'], 'input')
+        self.assertEqual(self.env['project.project'].search_count([]), projects_before)
+        self.assertEqual(self.env['project.task'].search_count([]), tasks_before + 1)
+        command = json.loads(run.canonical_command_json)
+        with patch.object(type(self.Run), '_call_canonical_boundary', return_value={
+                'receipt': dict(failure, status='cancelled', revision=3, result={'error_code': 'CANCELLED_BY_OPERATOR'}),
+                'command_id': command['command_id'], 'command_revision': 1}):
+            self.assertTrue(self.Run._dispatch_canonical_receipts())
+        self.assertFalse(run.canonical_command_json)
+        self.assertEqual(run.error_message, 'SUPERSEDED_BY_INPUT')
+        self.assertFalse(child.canonical_job_id)
+
+    def test_canonical_transcript_revision_rolls_back_child_task_and_cancel_intent(self):
+        self.canonical_workspace()
+        run = self.Run.create(dict(self.values('canonical-input-rollback'), source_type='youtube',
+                                   source_url='https://www.youtube.com/watch?v=4GVbqYFmGBw',
+                                   is_manual_transcript=True))
+        run._apply_canonical_receipt(self.canonical_receipt(run, status='failed', revision=2, attempt=1,
+                                                          result={'error_code': 'YOUTUBE_TRANSCRIPTS_DISABLED'}))
+        tasks_before = self.env['project.task'].search_count([])
+        with self.assertRaises(ValidationError), self.env.cr.savepoint():
+            run.action_supply_transcript('Explicit revised input.', 'canonical-input-rollback-child', expected_revision=run.revision)
+            raise ValidationError('Disposable caller rollback')
+        run.invalidate_recordset()
+        self.assertEqual(run.status, 'waiting_input')
+        self.assertFalse(run.canonical_command_json)
+        self.assertFalse(run.input_revision_ids)
+        self.assertEqual(self.env['project.task'].search_count([]), tasks_before)
+
+    def test_canonical_cancel_accepts_one_intent_without_network_and_dispatches_afterwards(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-cancel'))
+        expected = run.revision
+        with patch.object(type(self.Run), '_call_canonical_boundary', side_effect=AssertionError('No network before commit')):
+            self.assertTrue(run.action_cancel(expected_revision=expected))
+            intent = run.canonical_command_json
+            self.assertTrue(run.action_cancel(expected_revision=expected))
+            self.assertEqual(run.canonical_command_json, intent)
+        self.assertEqual(run.status, 'cancelled')
+        self.assertFalse(run.canonical_job_id)
+        command = json.loads(intent)
+        accepted = self.canonical_receipt(run)
+        cancelled = dict(accepted, revision=2, status='cancelled', result={'error_code': 'CANCELLED_BY_OPERATOR'})
+        calls = []
+
+        def boundary(record, payload):
+            calls.append(payload)
+            if payload['action'] == 'submit':
+                return accepted
+            return {'receipt': cancelled, 'command_id': command['command_id'], 'command_revision': 1}
+
+        with patch.object(type(self.Run), '_call_canonical_boundary', boundary):
+            self.assertTrue(self.Run._dispatch_canonical_receipts())
+            self.assertFalse(self.Run._dispatch_canonical_receipts())
+        self.assertEqual([payload['action'] for payload in calls], ['submit', 'cancel'])
+        self.assertEqual(calls[1]['expected_revision'], 0)
+        self.assertEqual(run.canonical_command_revision, 1)
+        self.assertFalse(run.canonical_command_json)
+        self.assertEqual(run.task_id.facodi_external_ref, accepted['job_id'])
+        self.assertFalse(run.metadata_json)
+        self.assertTrue(run.action_cancel(expected_revision=expected))
+        self.assertFalse(run.canonical_command_json)
+
+    def test_canonical_cancel_running_work_without_changing_legacy_command_policy(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-cancel-running'))
+        running = self.canonical_receipt(run, status='processing', revision=2, attempt=1)
+        run._apply_canonical_receipt(running)
+        self.assertEqual(run.status, 'running')
+        self.assertTrue(run.action_cancel(expected_revision=run.revision))
+        self.assertEqual(run.status, 'cancelled')
+        self.assertEqual(json.loads(run.history_json)[-1]['from'], 'running')
+        self.assertTrue(run.canonical_command_json)
+
+    def test_canonical_cancel_rejects_wrong_ack_and_preserves_pending_intent(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-cancel-wrong-ack'))
+        accepted = self.canonical_receipt(run)
+        run._apply_canonical_receipt(accepted)
+        run.action_cancel(expected_revision=run.revision)
+        pending = run.canonical_command_json
+        with patch.object(type(self.Run), '_call_canonical_boundary', return_value={
+                'receipt': dict(accepted, status='cancelled', revision=2),
+                'command_id': str(uuid4()), 'command_revision': 1}):
+            with self.assertRaises(ValidationError):
+                self.Run._dispatch_canonical_receipts()
+        self.assertEqual(run.canonical_command_json, pending)
+        self.assertEqual(run.canonical_receipt_revision, 1)
+        self.assertEqual(run.status, 'cancelled')
+
+    def test_canonical_intake_and_task_roll_back_together(self):
+        self.canonical_workspace()
+        runs_before = self.env['facodi.pipeline.run'].search_count([])
+        tasks_before = self.env['project.task'].search_count([])
+        with self.assertRaises(ValidationError), self.env.cr.savepoint():
+            run = self.Run.create(self.values('atomic-canonical'))
+            self.assertTrue(run.task_id.facodi_ref)
+            raise ValidationError('Reject the uncommitted downstream receipt')
+        self.assertEqual(self.env['facodi.pipeline.run'].search_count([]), runs_before)
+        self.assertEqual(self.env['project.task'].search_count([]), tasks_before)
+
+    def canonical_receipt(self, run, **values):
+        receipt = {'job_id': str(uuid4()), 'task_ref': run.task_id.facodi_ref,
+                   'company_id': run.company_id.id, 'cohort': 'p2', 'revision': 1,
+                   'status': 'queued', 'attempt': 0, 'result': {}}
+        receipt.update(values)
+        return receipt
+
+    def test_canonical_intake_freezes_request_without_network(self):
+        self.canonical_workspace()
+        with patch.object(type(self.Run), '_call_canonical_boundary', side_effect=AssertionError('No network during acceptance')):
+            run = self.Run.create(self.values('canonical-outbox'))
+        request = json.loads(run.canonical_payload_json)
+        self.assertEqual(request['raw_content'], run.raw_content)
+        self.assertEqual(request['provider_config'], json.loads(run.provider_config_json))
+        self.assertEqual(request['catalog_snapshot'], json.loads(run.catalog_snapshot_json))
+        accepted = run.canonical_payload_json
+        self.channel.name = 'Human rename after acceptance'
+        self.assertEqual(run.canonical_payload_json, accepted)
+        self.assertFalse(run.canonical_job_id)
+
+    def test_canonical_unsupported_or_oversized_source_fails_before_acceptance(self):
+        self.canonical_workspace()
+        before = self.env['facodi.pipeline.run'].search_count([])
+        for values in [dict(self.values('canonical-document'), source_type='document'),
+                       dict(self.values('canonical-large'), raw_content='x' * 12001)]:
+            with self.assertRaises(UserError), self.env.cr.savepoint():
+                self.Run.create(values)
+        self.assertEqual(self.env['facodi.pipeline.run'].search_count([]), before)
+
+    def test_canonical_automatic_transcript_freezes_acquisition_without_precommit_network(self):
+        self.canonical_workspace()
+        with patch.object(type(self.Run), '_call_canonical_boundary', side_effect=AssertionError('No precommit network')):
+            run = self.Run.create(dict(self.values('canonical-automatic-transcript'), source_type='youtube',
+                                       source_url='https://www.youtube.com/watch?v=4GVbqYFmGBw', raw_content=''))
+        request = json.loads(run.canonical_payload_json)
+        self.assertEqual(request['acquisition_config'], {'provider': 'youtube-transcript-plus', 'version': '2.0.3'})
+        self.assertEqual(request['raw_content'], '')
+        self.assertEqual(run.execution_plane, 'supabase')
+        self.assertFalse(run.is_manual_transcript)
+        self.assertFalse(run.canonical_job_id)
+        self.assertFalse(run.task_id.child_ids)
+
+    def test_canonical_automatic_transcript_receipt_requires_immutable_extraction_evidence(self):
+        self.canonical_workspace()
+        run = self.Run.create(dict(self.values('canonical-automatic-evidence'), source_type='youtube',
+                                   source_url='https://www.youtube.com/watch?v=4GVbqYFmGBw', raw_content=''))
+        document = {'text_content': 'Acquired source evidence.', 'language': run.language,
+                    'source_url': run.source_url, 'extraction_provider': 'youtube-transcript-plus',
+                    'extraction_version': '2.0.3'}
+        catalog = json.loads(run.catalog_snapshot_json)
+        document_id = str(uuid4())
+        result = {'metadata': {'document_data': document},
+                  'document_data': {'text_content': document['text_content'], 'language': run.language},
+                  'enriched_data': {'id': document_id, 'summary': document['text_content'], 'concepts': [],
+                                    'provider_name': 'baseline-deterministic', 'model_name': 'regex-frequency-v2-evidence'},
+                  'mapping_data': {'snapshot_id': catalog['snapshot_id'], 'snapshot_hash': catalog['snapshot_hash'],
+                                   'enriched_document_id': document_id, 'ranking_algorithm_version': 'deterministic-v2',
+                                   'candidates': [], 'unmatched_concepts': []}, 'chunks': []}
+        receipt = self.canonical_receipt(run, status='needs_review', revision=3, attempt=1, result=result)
+        for changed in [dict(document, source_url='https://www.youtube.com/watch?v=dQw4w9WgXcQ'),
+                        dict(document, text_content='Different source'), dict(document, extraction_version='unaccepted')]:
+            with self.assertRaises(ValidationError):
+                run._apply_canonical_receipt(dict(receipt, result=dict(result, metadata={'document_data': changed})))
+        self.assertTrue(run._apply_canonical_receipt(receipt))
+        self.assertEqual(run.raw_content, '')
+        self.assertEqual(json.loads(run.canonical_payload_json)['raw_content'], '')
+        self.assertEqual(run.status, 'waiting_review')
+        self.assertFalse(run.published_slide_id)
+        self.assertFalse(run._apply_canonical_receipt(receipt))
+
+    def test_canonical_ascii_transport_budget_rejects_without_partial_effects(self):
+        self.canonical_workspace()
+        self.channel.name = '\u00e9' * 6000
+        before = self.env['facodi.pipeline.run'].search_count([])
+        tasks_before = self.env['project.task'].search_count([])
+        with self.assertRaises(UserError), self.env.cr.savepoint():
+            self.Run.create(dict(self.values('canonical-escaped-budget'), raw_content='\U0001f600' * 3000))
+        self.assertEqual(self.env['facodi.pipeline.run'].search_count([]), before)
+        self.assertEqual(self.env['project.task'].search_count([]), tasks_before)
+
+    def test_canonical_legacy_payload_and_ascii_receipt_replay_remain_compatible(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-legacy-encoding'))
+        request = json.loads(run.canonical_payload_json)
+        request.pop('catalog_snapshot')
+        run._set_execution_values({'canonical_payload_json': json.dumps(request)})
+        result = {'document_data': {'text_content': run.raw_content, 'language': run.language},
+                  'enriched_data': {'summary': 'Reviewable \u00e9 evidence.', 'concepts': [],
+                                    'provider_name': 'baseline-deterministic', 'model_name': 'regex-frequency-v2-evidence'},
+                  'chunks': []}
+        receipt = self.canonical_receipt(run, status='needs_review', revision=2, attempt=1, result=result)
+        self.assertTrue(run._apply_canonical_receipt(receipt))
+        run._set_execution_values({'canonical_receipt_json': json.dumps(receipt, sort_keys=True, ensure_ascii=True)})
+        revision = run.revision
+        self.assertFalse(run._apply_canonical_receipt(receipt))
+        self.assertEqual(run.revision, revision)
+
+    def test_canonical_receipt_replay_binds_stable_job_once(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-bind'))
+        receipt = self.canonical_receipt(run)
+        self.assertTrue(run._apply_canonical_receipt(receipt))
+        revision = run.revision
+        self.assertFalse(run._apply_canonical_receipt(receipt))
+        self.assertEqual(run.revision, revision)
+        self.assertEqual(run.task_id.facodi_external_ref, receipt['job_id'])
+        with self.assertRaises(ValidationError):
+            run._apply_canonical_receipt(dict(receipt, job_id=str(uuid4()), revision=2))
+
+    def test_canonical_dispatch_polling_does_not_starve_later_executions(self):
+        self.canonical_workspace()
+        first = self.Run.create(self.values('canonical-first-poll'))
+        second = self.Run.create(self.values('canonical-second-poll'))
+        called = []
+
+        def boundary(run, payload):
+            called.append(run.id)
+            return self.canonical_receipt(run)
+
+        with patch.object(type(self.Run), '_call_canonical_boundary', boundary):
+            self.env['facodi.pipeline.run']._dispatch_canonical_receipts()
+            self.env['facodi.pipeline.run']._dispatch_canonical_receipts()
+        self.assertEqual(called, [first.id, second.id])
+        self.assertTrue(first.canonical_polled_at)
+        self.assertTrue(second.canonical_polled_at)
+
+    def test_canonical_receipt_denies_scope_and_revision_conflicts(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-scope'))
+        receipt = self.canonical_receipt(run)
+        for change in [{'company_id': run.company_id.id + 1}, {'task_ref': 'task:' + str(uuid4())},
+                       {'cohort': 'legacy'}, {'status': 'published'}, {'revision': True}]:
+            with self.assertRaises(ValidationError):
+                run._apply_canonical_receipt(dict(receipt, **change))
+        run._apply_canonical_receipt(receipt)
+        with self.assertRaises(ValidationError):
+            run._apply_canonical_receipt(dict(receipt, status='processing'))
+        self.assertEqual(run.status, 'received')
+
+    def test_canonical_terminal_receipt_requires_accepted_source_provider_and_no_publication(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-result'))
+        result = {'document_data': {'text_content': run.raw_content, 'language': run.language},
+                  'enriched_data': {'id': str(uuid4()), 'summary': 'A real reviewable paragraph.', 'concepts': [],
+                                    'provider_name': 'baseline-deterministic', 'model_name': 'regex-frequency-v2-evidence'},
+                  'chunks': []}
+        catalog = json.loads(run.catalog_snapshot_json)
+        result['mapping_data'] = {'snapshot_id': catalog['snapshot_id'], 'snapshot_hash': catalog['snapshot_hash'],
+                                 'enriched_document_id': result['enriched_data']['id'],
+                                 'ranking_algorithm_version': 'deterministic-v2', 'candidates': [], 'unmatched_concepts': []}
+        receipt = self.canonical_receipt(run, status='needs_review', revision=6, attempt=4, result=result)
+        invalid = dict(result, document_data={'text_content': 'Different source', 'language': 'pt'})
+        with self.assertRaises(ValidationError):
+            run._apply_canonical_receipt(dict(receipt, result=invalid))
+        for mapping in [dict(result['mapping_data'], snapshot_hash='0' * 64),
+                        dict(result['mapping_data'], candidates=[{'target_id': 'channel_999999999'}]),
+                        dict(result['mapping_data'], enriched_document_id=str(uuid4()))]:
+            with self.assertRaises(ValidationError):
+                run._apply_canonical_receipt(dict(receipt, result=dict(result, mapping_data=mapping)))
+        run._apply_canonical_receipt(receipt)
+        self.assertEqual(run.status, 'waiting_review')
+        self.assertFalse(run.published_slide_id)
+        self.assertFalse(run.reviewed_by_id)
+        self.assertFalse(run._apply_canonical_receipt(receipt))
+
+    def test_canonical_terminal_poll_has_no_second_editorial_revision(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-terminal-poll'))
+        receipt = self.canonical_receipt(run, status='failed', revision=3, attempt=1,
+                                         result={'error_code': 'ATTEMPT_BUDGET_EXHAUSTED'})
+        before = run.revision
+        with patch.object(type(self.Run), '_call_canonical_boundary', return_value=receipt):
+            self.env['facodi.pipeline.run']._dispatch_canonical_receipts()
+        self.assertEqual(run.status, 'failed')
+        self.assertEqual(run.revision, before + 1)
+        self.assertFalse(run.canonical_polled_at)
+        self.assertEqual(len(run.task_id.activity_ids), 1)
+        activity = run.task_id.activity_ids
+        self.assertEqual(activity.user_id, self.channel.user_id)
+        self.assertEqual(activity.summary, 'Canonical processing requires review')
+        self.assertFalse(activity.note)
+        self.assertFalse(run._apply_canonical_receipt(receipt))
+        self.assertEqual(run.task_id.activity_ids, activity)
 
     def test_health_reports_loaded_addon_version(self):
         import json

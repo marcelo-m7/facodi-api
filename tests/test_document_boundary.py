@@ -60,3 +60,18 @@ def test_docx_expansion_budget_is_enforced():
     with pytest.raises(ValueError):
         document.DocumentIngestionAdapter().ingest(ContentSource(
             SourceType.DOCUMENT, raw_file_name='expanded.docx', raw_file_bytes=stream.getvalue()))
+
+
+def test_converter_cannot_inherit_credentials_or_python_path(tmp_path, monkeypatch):
+    script = tmp_path / 'environment.py'
+    script.write_text(
+        'import json, os, sys\n'
+        'blocked = ["SUPABASE_SECRET_KEY", "GEMINI_API_KEY", "ODOO_DB_PASSWORD", "PYTHONPATH"]\n'
+        'assert not any(name in os.environ for name in blocked)\n'
+        'assert sys.flags.isolated == 1\n'
+        'print(json.dumps({"text": "Credential-free conversion boundary"}))\n'
+    )
+    for name in ('SUPABASE_SECRET_KEY', 'GEMINI_API_KEY', 'ODOO_DB_PASSWORD', 'PYTHONPATH'):
+        monkeypatch.setenv(name, 'disposable-test-sentinel')
+    monkeypatch.setattr(document, '_WORKER_SCRIPT', script)
+    assert document.extract_document(b'input', '.txt') == 'Credential-free conversion boundary'

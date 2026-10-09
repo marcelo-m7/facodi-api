@@ -63,3 +63,19 @@ jobs:
           from odoo.addons.facodi_project.tests.test_preservation import verify_history
           verify_history(env)
           PY
+      - name: Install API runtime dependencies in an isolated environment
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3-venv
+          python3 -m venv --system-site-packages /opt/facodi-api-ci
+          /opt/facodi-api-ci/bin/python -m pip install --no-cache-dir 'setuptools>=68.2.2' -r requirements.txt
+          /opt/facodi-api-ci/bin/python -m pip check
+      - name: Native API intake and security suite
+        run: |
+          /opt/facodi-api-ci/bin/python /usr/bin/odoo --db_host=postgres --db_user=odoo --db_password="$PGPASSWORD" --database=facodi_project_api_ci --addons-path="/usr/lib/python3/dist-packages/odoo/addons,$GITHUB_WORKSPACE" --init=facodi_api --without-demo=true --test-enable --test-tags=/facodi_api --stop-after-init --no-http --workers=0 --max-cron-threads=0 2>&1 | tee /tmp/api-native.log
+          grep -Eq 'odoo.tests.result: 0 failed, 0 error\(s\) of [1-9][0-9]* tests' /tmp/api-native.log
+      - name: Two consecutive API upgrades
+        run: |
+          for upgrade in 1 2; do
+            /opt/facodi-api-ci/bin/python /usr/bin/odoo --db_host=postgres --db_user=odoo --db_password="$PGPASSWORD" --database=facodi_project_api_ci --addons-path="/usr/lib/python3/dist-packages/odoo/addons,$GITHUB_WORKSPACE" --update=facodi_api --without-demo=true --stop-after-init --no-http --workers=0 --max-cron-threads=0
+          done
