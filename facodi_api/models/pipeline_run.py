@@ -521,7 +521,7 @@ class FacodiPipelineRun(models.Model):
                     parts.append(part)
                 try:
                     result = json.loads(b''.join(parts), parse_constant=lambda value: (_ for _ in ()).throw(ValueError()))
-                    if payload['action'] == 'cancel':
+                    if payload['action'] in {'cancel', 'retry'}:
                         if not isinstance(result, dict) or not isinstance(result['receipt'], dict):
                             raise ValueError()
                         return result
@@ -651,11 +651,14 @@ class FacodiPipelineRun(models.Model):
                 run._apply_canonical_receipt(run._call_canonical_boundary(dict(
                     payload, action='submit', request=json.loads(run.canonical_payload_json))))
             response = run._call_canonical_boundary(dict(payload, job_id=run.canonical_job_id, **command))
+            expected_status = 'cancelled' if command['action'] == 'cancel' else 'queued'
             if (not isinstance(response, dict) or response.get('command_id') != command['command_id']
                     or type(response.get('command_revision')) is not int
                     or response['command_revision'] != command['expected_revision'] + 1
                     or not isinstance(response.get('receipt'), dict)
-                    or response['receipt'].get('status') != 'cancelled'):
+                    or response['receipt'].get('status') != expected_status
+                    or type(response['receipt'].get('revision')) is not int
+                    or response['receipt']['revision'] <= run.canonical_receipt_revision):
                 raise ValidationError('CANONICAL_COMMAND_CONFLICT')
             run._apply_canonical_receipt(response['receipt'])
             run._set_execution_values({'canonical_command_json': False,
@@ -711,13 +714,15 @@ class FacodiPipelineRun(models.Model):
             raise UserError("Canonical execution commands require the Supabase boundary.")
 
     def _apply_command(self, command, expected_revision):
-        self._lock_command(allow_canonical=command == 'cancel')
+        self._lock_command(allow_canonical=command in {'cancel', 'retry'})
         if type(expected_revision) is not int or expected_revision < 0:
             raise InvalidTransition("A nonnegative expected_revision is required.")
         # Replay identifies the exact already-applied command, never a fresh retry.
         if any(event.get("command") == command and event.get("from_revision") == expected_revision
                for event in json.loads(self.history_json or "[]")):
             return True
+        if self.execution_plane == 'supabase' and self.canonical_command_json:
+            raise RevisionConflict('A canonical command is awaiting acknowledgment.')
         if self.execution_plane == 'supabase' and command == 'cancel' and self.status == 'running':
             if self.revision != expected_revision:
                 raise RevisionConflict('Run changed before cancellation was requested.')

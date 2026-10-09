@@ -11,6 +11,7 @@ if importlib.util.find_spec("odoo") is None:
 from odoo.fields import Command
 from odoo.exceptions import AccessError, UserError, ValidationError
 from odoo.tests import TransactionCase, tagged
+from ..core.contracts.lifecycle import InvalidTransition, RevisionConflict
 
 
 @tagged('post_install', '-at_install')
@@ -105,9 +106,78 @@ class TestPipelineSecurity(TransactionCase):
         self.assertEqual(run.execution_plane, 'supabase')
         with self.assertRaises(AccessError):
             run.with_context(facodi_pipeline_internal=True).write({'execution_plane': 'odoo_python'})
-        with self.assertRaises(UserError):
+        with self.assertRaises(InvalidTransition):
             run.action_retry(expected_revision=run.revision)
         self.assertEqual(run.status, 'received')
+
+    def test_canonical_retry_accepts_one_intent_and_keeps_task_input_and_attempt_history(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-retry'))
+        failed = self.canonical_receipt(run, status='failed', revision=2, attempt=1,
+                                        result={'error_code': 'PROVIDER_FAILED'})
+        run._apply_canonical_receipt(failed)
+        expected = run.revision
+        original = (run.task_id, run.canonical_payload_json, run.provider_config_json, run.raw_content)
+        with patch.object(type(self.Run), '_call_canonical_boundary', side_effect=AssertionError('No network before commit')):
+            self.assertTrue(run.action_retry(expected_revision=expected))
+            intent = run.canonical_command_json
+            self.assertTrue(run.action_retry(expected_revision=expected))
+            self.assertEqual(run.canonical_command_json, intent)
+            with self.assertRaises(RevisionConflict):
+                run.action_cancel(expected_revision=run.revision)
+        self.assertEqual(run.status, 'received')
+        self.assertEqual(run.attempt_count, 1)
+        command = json.loads(intent)
+        queued = dict(failed, revision=3, status='queued', result={})
+        with patch.object(type(self.Run), '_call_canonical_boundary', return_value={
+                'receipt': queued, 'command_id': command['command_id'], 'command_revision': 1}) as boundary:
+            self.assertTrue(self.Run._dispatch_canonical_receipts())
+        self.assertEqual(boundary.call_args[0][0]['action'], 'retry')
+        self.assertEqual(boundary.call_args[0][0]['job_id'], failed['job_id'])
+        self.assertEqual(boundary.call_args[0][0]['expected_revision'], 0)
+        self.assertFalse(run.canonical_command_json)
+        self.assertEqual(run.canonical_command_revision, 1)
+        self.assertTrue(run.action_retry(expected_revision=expected))
+        self.assertFalse(run.canonical_command_json)
+        run._apply_canonical_receipt(dict(failed, revision=4, attempt=2))
+        self.assertEqual(run.attempt_count, 2)
+        run.action_retry(expected_revision=run.revision)
+        next_command = json.loads(run.canonical_command_json)
+        self.assertEqual(next_command['expected_revision'], 1)
+        self.assertNotEqual(next_command['command_id'], command['command_id'])
+        self.assertEqual((run.task_id, run.canonical_payload_json, run.provider_config_json, run.raw_content), original)
+        self.assertEqual(run.canonical_job_id, failed['job_id'])
+        self.assertEqual(run.task_id.facodi_external_ref, failed['job_id'])
+
+    def test_canonical_retry_denies_invalid_ack_without_losing_intent_or_prior_receipt(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-retry-ack'))
+        failed = self.canonical_receipt(run, status='failed', revision=2, attempt=1)
+        run._apply_canonical_receipt(failed)
+        run.action_retry(expected_revision=run.revision)
+        intent, receipt = run.canonical_command_json, run.canonical_receipt_json
+        command = json.loads(intent)
+        response = {'command_id': command['command_id'], 'command_revision': 1,
+                    'receipt': dict(failed, status='queued', revision=3, result={})}
+        for changed in [dict(response, command_id=str(uuid4())), dict(response, command_revision=True),
+                        dict(response, receipt=dict(response['receipt'], status='cancelled')),
+                        dict(response, receipt=dict(response['receipt'], revision=1))]:
+            with patch.object(type(self.Run), '_call_canonical_boundary', return_value=changed):
+                with self.assertRaises(ValidationError):
+                    self.Run._dispatch_canonical_receipts()
+            self.assertEqual(run.canonical_command_json, intent)
+            self.assertEqual(run.canonical_receipt_json, receipt)
+            self.assertEqual(run.canonical_command_revision, 0)
+
+    def test_canonical_retry_cannot_reset_exhausted_lifetime_attempts(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-retry-budget'))
+        run._apply_canonical_receipt(self.canonical_receipt(run, status='failed', revision=2, attempt=20))
+        with self.assertRaises(InvalidTransition):
+            run.action_retry(expected_revision=run.revision)
+        self.assertEqual(run.status, 'failed')
+        self.assertEqual(run.attempt_count, 20)
+        self.assertFalse(run.canonical_command_json)
 
     def test_canonical_cancel_accepts_one_intent_without_network_and_dispatches_afterwards(self):
         self.canonical_workspace()

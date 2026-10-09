@@ -13,7 +13,7 @@ Only administrators may configure `facodi_api.canonical_intake_enabled` and
 `facodi_api.canonical_workspace.<website_id>` using an explicitly managed Project
 ID in the Website company. Intake freezes `execution_plane` and creates/reuses
 one canonical task atomically. Replay after route changes preserves the accepted
-executor and human work; the old cron/commands cannot process canonical jobs.
+executor and human work; the legacy worker cannot process canonical jobs.
 Old runs are not adopted or backfilled. Missing or inaccessible workspaces fail
 closed, without per-run fallback Projects or mandatory technical subtasks.
 
@@ -49,13 +49,21 @@ acknowledgement is recorded. Technical receipt revisions do not change the
 command version. Supabase archives the queue message and fences the old claim
 atomically, preserving the prior receipt in an append-only service-only audit.
 Already active external I/O is not interrupted; its worker cannot checkpoint or
-finish after cancellation. Retry and new transcript revisions remain unavailable
-on this canonical slice. Legacy command policy and accepted inputs are unchanged.
+finish after cancellation. Legacy command policy and accepted inputs are unchanged.
 
-Forty-seven native API security tests passed locally. The deployment harness also
+Canonical retry uses the same versioned post-commit outbox for failed jobs only.
+It retains the native task, external job, accepted request/provider and committed
+checkpoints; a saved analysis is reused without another paid call. The durable
+command atomically requeues one message, preserves the previous failed receipt
+and grants at most two additional claims, capped at twenty lifetime attempts.
+Pending commands cannot be replaced, and acknowledgements must advance both the
+command version and technical receipt. Retry cannot revive cancelled jobs or
+reset an exhausted lifetime budget. New transcript revisions remain unavailable.
+
+Fifty native API security tests passed locally. The deployment harness also
 proves one unpublished native Learning result/attempt and idempotent replay.
 Do not enable this candidate in production: worker scheduling, all-source and
-large-catalog parity, versioned retry/input, final integrated acceptance
+large-catalog parity, versioned input, final integrated acceptance
 and productive target/image/canary proof remain required. Source test success is
 not runtime image identity. Owner CI retains native Project/API gates, real
 Project concurrency and repeated upgrades.
