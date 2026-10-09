@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import os
+import re
 import uuid
 import requests
 from html import escape
@@ -479,14 +480,16 @@ class FacodiPipelineRun(models.Model):
                                            json.dumps(self._server_provider_configuration(), sort_keys=True))
             vals['catalog_snapshot_json'] = (predecessor.catalog_snapshot_json if predecessor else
                                             json.dumps(self._build_catalog_snapshot(channel).to_dict(), ensure_ascii=False))
-            if workspace:
-                vals['canonical_payload_json'] = json.dumps(self._canonical_request(vals), sort_keys=True, allow_nan=False)
             prepared.append(vals)
         clean_context = {key: value for key, value in self.env.context.items() if not key.startswith("default_")}
         trusted_model = self.with_context(clean_context)
         runs = super(FacodiPipelineRun, trusted_model).create(prepared)
         for run in runs:
             run._ensure_project_task()
+            if run.execution_plane == 'supabase':
+                run._set_execution_values({
+                    'canonical_payload_json': json.dumps(run._canonical_request(), sort_keys=True, allow_nan=False),
+                })
         return runs
 
     @api.model
@@ -504,22 +507,65 @@ class FacodiPipelineRun(models.Model):
             raise AccessError("The managed workspace must belong to the Website company.")
         return workspace
 
-    @api.model
-    def _canonical_request(self, values):
+    def _canonical_artifact_reference(self, kind, content):
+        self.ensure_one()
+        task_ref = self.task_id.facodi_ref or ''
+        match = re.fullmatch(r'task:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', task_ref)
+        if not match or kind not in {'source', 'catalog'}:
+            raise UserError('CANONICAL_ARTIFACT_SCOPE_INVALID')
+        digest = hashlib.sha256(content).hexdigest()
+        return {
+            'bucket': 'facodi-canonical-private',
+            'key': 'companies/%s/tasks/%s/%s/%s' % (self.company_id.id, match.group(1), kind, digest),
+            'sha256': digest,
+            'byte_length': len(content),
+        }
+
+    def _canonical_request(self):
+        self.ensure_one()
+        values = {
+            'source_type': self.source_type,
+            'source_url': self.source_url or '',
+            'title': self.title or '',
+            'raw_content': self.raw_content or '',
+            'language': self.language or 'pt',
+            'is_manual_transcript': self.is_manual_transcript,
+            'attachment_id': self.attachment_id.id,
+        }
         automatic_transcript = (values['source_type'] == 'youtube' and not values['is_manual_transcript']
                                 and not values['raw_content'].strip())
-        if (values['source_type'] not in {'manual', 'markdown', 'youtube'}
+        request = {name: values[name] for name in ('source_type', 'source_url', 'title', 'raw_content', 'language')}
+        if values['source_type'] == 'document' and values['attachment_id']:
+            content, digest, filename = self._attachment_details(
+                values['attachment_id'], self.target_channel_id.id, accepted_run=self,
+            )
+            if digest != self.attachment_digest or filename != self.attachment_name_snapshot:
+                raise UserError('CANONICAL_INPUT_CHANGED')
+            request.update(
+                source_artifact=self._canonical_artifact_reference('source', content),
+                source_filename=os.path.basename(filename),
+                execution_runtime='isolated',
+            )
+        elif (values['source_type'] not in {'manual', 'markdown', 'youtube'}
                 or values['attachment_id'] or (not values['raw_content'].strip() and not automatic_transcript)
                 or (values['source_type'] == 'youtube' and not values['is_manual_transcript'] and not automatic_transcript)
                 or len(values['raw_content'].encode('utf-8')) > 12000):
-            raise UserError('The canonical cohort requires bounded text or a frozen automatic transcript acquisition; no source is truncated.')
-        request = {name: values[name] for name in ('source_type', 'source_url', 'title', 'raw_content', 'language')}
+            raise UserError('The canonical cohort requires bounded text, an accepted document, or a frozen transcript acquisition; no source is truncated.')
+        if values['source_type'] == 'document' and not values['attachment_id']:
+            raise UserError('The canonical cohort requires an accepted document attachment.')
         if automatic_transcript:
             request['acquisition_config'] = {'provider': 'youtube-transcript-plus', 'version': '2.0.3'}
         if values['source_type'] != 'youtube' and values['source_url']:
             raise UserError('The canonical text cohort does not acquire external document URLs.')
-        request['provider_config'] = json.loads(values['provider_config_json'])
-        request['catalog_snapshot'] = json.loads(values['catalog_snapshot_json'])
+        request['provider_config'] = json.loads(self.provider_config_json)
+        catalog = json.loads(self.catalog_snapshot_json)
+        request['catalog_snapshot'] = catalog
+        if len(json.dumps(request, allow_nan=False).encode('utf-8')) > 60000:
+            catalog_bytes = json.dumps(catalog, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+            if len(catalog_bytes) > 4 * 1024 * 1024:
+                raise UserError('The accepted canonical catalog exceeds four MiB.')
+            request.pop('catalog_snapshot')
+            request['catalog_artifact'] = self._canonical_artifact_reference('catalog', catalog_bytes)
         if len(json.dumps(request, allow_nan=False).encode('utf-8')) > 60000:
             raise UserError('The accepted canonical request exceeds the transport budget.')
         return request
@@ -552,6 +598,67 @@ class FacodiPipelineRun(models.Model):
                     return result['receipt']
                 except (KeyError, TypeError, ValueError):
                     raise UserError('INVALID_CANONICAL_RECEIPT') from None
+
+    def _upload_canonical_artifacts(self, request):
+        self.ensure_one()
+        artifacts = []
+        if request.get('source_artifact'):
+            content, digest, filename = self._attachment_details(
+                self.attachment_id.id, self.target_channel_id.id, accepted_run=self,
+            )
+            if digest != self.attachment_digest or filename != self.attachment_name_snapshot:
+                raise UserError('CANONICAL_INPUT_CHANGED')
+            artifacts.append(('source', content, request['source_artifact']))
+        if request.get('catalog_artifact'):
+            catalog = json.loads(self.catalog_snapshot_json)
+            content = json.dumps(catalog, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+            artifacts.append(('catalog', content, request['catalog_artifact']))
+        if not artifacts:
+            return
+        host = (os.environ.get('SUPABASE_URL') or '').rstrip('/')
+        secret = (os.environ.get('SUPABASE_SECRET_KEY') or '').strip()
+        if host != 'https://bhfywztfyidvrlarebmg.supabase.co' or not secret.startswith('sb_secret_'):
+            raise UserError('The approved canonical service target and secret credential are required.')
+        task_ref = self.task_id.facodi_ref
+        task_id = task_ref.removeprefix('task:')
+        for kind, content, accepted_reference in artifacts:
+            expected = self._canonical_artifact_reference(kind, content)
+            if expected != accepted_reference:
+                raise UserError('CANONICAL_ARTIFACT_INPUT_CHANGED')
+            endpoint = '%s/functions/v1/v4_canonical_analysis/artifacts/%s/%s/%s' % (
+                host, self.company_id.id, task_id, kind,
+            )
+            try:
+                with requests.Session() as session:
+                    session.trust_env = False
+                    with session.post(
+                        endpoint, data=content,
+                        headers={'apikey': secret, 'content-type': 'application/octet-stream',
+                                 'user-agent': 'FACODI-Odoo/19 CanonicalArtifact'},
+                        timeout=(5, 60), allow_redirects=False, stream=True,
+                    ) as response:
+                        if response.status_code != 201:
+                            raise UserError('CANONICAL_ARTIFACT_UNAVAILABLE')
+                        parts, size = [], 0
+                        for part in response.iter_content(chunk_size=1024):
+                            size += len(part)
+                            if size > 4096:
+                                raise UserError('CANONICAL_ARTIFACT_RECEIPT_TOO_LARGE')
+                            parts.append(part)
+                        result = json.loads(b''.join(parts))
+                        if not isinstance(result, dict) or result.get('artifact') != expected:
+                            raise UserError('CANONICAL_ARTIFACT_IDENTITY_CONFLICT')
+            except requests.RequestException:
+                raise UserError('CANONICAL_ARTIFACT_UNAVAILABLE') from None
+            except (TypeError, ValueError):
+                raise UserError('CANONICAL_ARTIFACT_RECEIPT_INVALID') from None
+
+    def _submit_canonical_request(self, scope):
+        self.ensure_one()
+        request = json.loads(self.canonical_payload_json or '{}')
+        receipt = self._call_canonical_boundary(dict(scope, action='submit', request=request))
+        self._upload_canonical_artifacts(request)
+        return receipt
 
     def _apply_canonical_receipt(self, receipt):
         self.ensure_one()
@@ -689,8 +796,7 @@ class FacodiPipelineRun(models.Model):
         if run.canonical_command_json:
             command = json.loads(run.canonical_command_json)
             if not run.canonical_job_id:
-                run._apply_canonical_receipt(run._call_canonical_boundary(dict(
-                    payload, action='submit', request=json.loads(run.canonical_payload_json))))
+                run._apply_canonical_receipt(run._submit_canonical_request(payload))
             response = run._call_canonical_boundary(dict(payload, job_id=run.canonical_job_id, **command))
             expected_status = 'cancelled' if command['action'] == 'cancel' else 'queued'
             if (not isinstance(response, dict) or response.get('command_id') != command['command_id']
@@ -708,9 +814,10 @@ class FacodiPipelineRun(models.Model):
             return True
         if run.canonical_job_id:
             payload.update(action='receipt', job_id=run.canonical_job_id)
+            receipt = run._call_canonical_boundary(payload)
         else:
-            payload.update(action='submit', request=json.loads(run.canonical_payload_json))
-        run._apply_canonical_receipt(run._call_canonical_boundary(payload))
+            receipt = run._submit_canonical_request(payload)
+        run._apply_canonical_receipt(receipt)
         if run.status in {'received', 'running'}:
             self.env.cr.execute("SELECT clock_timestamp() AT TIME ZONE 'UTC'")
             run._set_execution_values({'canonical_polled_at': self.env.cr.fetchone()[0]})
