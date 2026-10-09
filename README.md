@@ -27,13 +27,25 @@ Terminal failures create one native review activity for the course responsible
 user (or accepted owner), without technical payload; identical replay creates
 neither another activity nor another editorial revision.
 
-The first cohort supports explicit manual/Markdown text and explicit YouTube
-transcripts up to 12000 UTF-8 bytes. Unsupported sources fail before intake; no
-content is silently truncated or acquired. The frozen baseline/Gemini provider
+The first cohort supports explicit manual/Markdown text, explicit YouTube
+transcripts and automatic YouTube acquisition up to 12000 UTF-8 bytes. Automatic
+requests accept empty text and freeze the server-owned acquisition provider and
+version. Unsupported sources fail before intake; no content is silently truncated.
+The frozen baseline/Gemini provider
 is preserved, never replaced by the semantically different v3 metadata fallback.
 The server-only target is the approved FACODI Supabase project and modern secret.
 Legacy providers, binary documents and old accepted runs retain their old route
 when canonical intake is disabled.
+
+Automatic acquisition runs in the durable Supabase worker through the pinned
+`youtube-transcript-plus` parser, with a shared 30-second deadline and a 2 MiB
+HTTP response bound. It permits only the accepted video's YouTube watch, player
+and timed-text endpoints, without redirects or transport credentials. The
+immutable metadata checkpoint retains the exact acquired text, language, source
+URL and extraction provider/version; recovery reuses it without acquiring again.
+Receipt projection requires matching provenance and never replaces the accepted
+empty input. Known input failures return the native input-required lifecycle
+before enrichment; manual input revisions remain available without publication.
 
 The accepted dispatch includes the complete authorized frozen course catalog,
 within the 60000-byte ASCII JSON transport budget; oversized snapshots fail
@@ -70,7 +82,7 @@ another Project or mandatory technical subtask. Learning may link exactly one
 new editorial request through the API extension point; it does not reroute the
 child through current provider configuration or execute it locally.
 
-Fifty-three native API security tests passed locally. The deployment harness also
+Fifty-five native API security tests and 104 pure contracts passed locally. The deployment harness also
 proves one unpublished native Learning result/attempt and idempotent replay.
 Do not enable this candidate in production: worker scheduling, all-source and
 large-catalog parity, final integrated acceptance

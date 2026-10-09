@@ -506,12 +506,16 @@ class FacodiPipelineRun(models.Model):
 
     @api.model
     def _canonical_request(self, values):
+        automatic_transcript = (values['source_type'] == 'youtube' and not values['is_manual_transcript']
+                                and not values['raw_content'].strip())
         if (values['source_type'] not in {'manual', 'markdown', 'youtube'}
-                or values['attachment_id'] or not values['raw_content'].strip()
-                or (values['source_type'] == 'youtube' and not values['is_manual_transcript'])
+                or values['attachment_id'] or (not values['raw_content'].strip() and not automatic_transcript)
+                or (values['source_type'] == 'youtube' and not values['is_manual_transcript'] and not automatic_transcript)
                 or len(values['raw_content'].encode('utf-8')) > 12000):
-            raise UserError('The canonical text cohort requires a bounded explicit transcript; no source is truncated or acquired implicitly.')
+            raise UserError('The canonical cohort requires bounded text or a frozen automatic transcript acquisition; no source is truncated.')
         request = {name: values[name] for name in ('source_type', 'source_url', 'title', 'raw_content', 'language')}
+        if automatic_transcript:
+            request['acquisition_config'] = {'provider': 'youtube-transcript-plus', 'version': '2.0.3'}
         if values['source_type'] != 'youtube' and values['source_url']:
             raise UserError('The canonical text cohort does not acquire external document URLs.')
         request['provider_config'] = json.loads(values['provider_config_json'])
@@ -600,13 +604,26 @@ class FacodiPipelineRun(models.Model):
             accepted = json.loads(self.provider_config_json)
             provider = 'baseline-deterministic' if accepted['provider'] == 'baseline' else 'gemini-structured'
             model = accepted['version'] if accepted['provider'] == 'baseline' else accepted['model']
+            request = json.loads(self.canonical_payload_json)
+            acquisition = request.get('acquisition_config')
+            source_conflict = not isinstance(source, dict) or source.get('text_content') != self.raw_content
+            if acquisition:
+                metadata = result.get('metadata', {})
+                document = metadata.get('document_data', {}) if isinstance(metadata, dict) else {}
+                text = source.get('text_content') if isinstance(source, dict) else None
+                source_conflict = (not isinstance(text, str) or not text.strip() or len(text.encode('utf-8')) > 12000
+                                   or not isinstance(document, dict) or document.get('text_content') != text
+                                   or document.get('language') != self.language
+                                   or document.get('source_url') != self.source_url
+                                   or document.get('extraction_provider') != acquisition['provider']
+                                   or document.get('extraction_version') != acquisition['version'])
             if (not isinstance(source, dict) or not isinstance(enriched, dict)
-                    or source.get('text_content') != self.raw_content or source.get('language') != self.language
+                    or source_conflict or source.get('language') != self.language
                     or not isinstance(enriched.get('summary'), str) or not enriched['summary'].strip()
                     or enriched.get('provider_name') != provider or enriched.get('model_name') != model
                     or not isinstance(result.get('chunks'), list)):
                 raise ValidationError('CANONICAL_RESULT_CONFLICT')
-            catalog = json.loads(self.canonical_payload_json).get('catalog_snapshot')
+            catalog = request.get('catalog_snapshot')
             if catalog:
                 mapping = result.get('mapping_data', {})
                 if (not isinstance(mapping, dict) or mapping.get('snapshot_id') != catalog['snapshot_id']

@@ -357,6 +357,47 @@ class TestPipelineSecurity(TransactionCase):
                 self.Run.create(values)
         self.assertEqual(self.env['facodi.pipeline.run'].search_count([]), before)
 
+    def test_canonical_automatic_transcript_freezes_acquisition_without_precommit_network(self):
+        self.canonical_workspace()
+        with patch.object(type(self.Run), '_call_canonical_boundary', side_effect=AssertionError('No precommit network')):
+            run = self.Run.create(dict(self.values('canonical-automatic-transcript'), source_type='youtube',
+                                       source_url='https://www.youtube.com/watch?v=4GVbqYFmGBw', raw_content=''))
+        request = json.loads(run.canonical_payload_json)
+        self.assertEqual(request['acquisition_config'], {'provider': 'youtube-transcript-plus', 'version': '2.0.3'})
+        self.assertEqual(request['raw_content'], '')
+        self.assertEqual(run.execution_plane, 'supabase')
+        self.assertFalse(run.is_manual_transcript)
+        self.assertFalse(run.canonical_job_id)
+        self.assertFalse(run.task_id.child_ids)
+
+    def test_canonical_automatic_transcript_receipt_requires_immutable_extraction_evidence(self):
+        self.canonical_workspace()
+        run = self.Run.create(dict(self.values('canonical-automatic-evidence'), source_type='youtube',
+                                   source_url='https://www.youtube.com/watch?v=4GVbqYFmGBw', raw_content=''))
+        document = {'text_content': 'Acquired source evidence.', 'language': run.language,
+                    'source_url': run.source_url, 'extraction_provider': 'youtube-transcript-plus',
+                    'extraction_version': '2.0.3'}
+        catalog = json.loads(run.catalog_snapshot_json)
+        document_id = str(uuid4())
+        result = {'metadata': {'document_data': document},
+                  'document_data': {'text_content': document['text_content'], 'language': run.language},
+                  'enriched_data': {'id': document_id, 'summary': document['text_content'], 'concepts': [],
+                                    'provider_name': 'baseline-deterministic', 'model_name': 'regex-frequency-v2-evidence'},
+                  'mapping_data': {'snapshot_id': catalog['snapshot_id'], 'snapshot_hash': catalog['snapshot_hash'],
+                                   'enriched_document_id': document_id, 'ranking_algorithm_version': 'deterministic-v2',
+                                   'candidates': [], 'unmatched_concepts': []}, 'chunks': []}
+        receipt = self.canonical_receipt(run, status='needs_review', revision=3, attempt=1, result=result)
+        for changed in [dict(document, source_url='https://www.youtube.com/watch?v=dQw4w9WgXcQ'),
+                        dict(document, text_content='Different source'), dict(document, extraction_version='unaccepted')]:
+            with self.assertRaises(ValidationError):
+                run._apply_canonical_receipt(dict(receipt, result=dict(result, metadata={'document_data': changed})))
+        self.assertTrue(run._apply_canonical_receipt(receipt))
+        self.assertEqual(run.raw_content, '')
+        self.assertEqual(json.loads(run.canonical_payload_json)['raw_content'], '')
+        self.assertEqual(run.status, 'waiting_review')
+        self.assertFalse(run.published_slide_id)
+        self.assertFalse(run._apply_canonical_receipt(receipt))
+
     def test_canonical_ascii_transport_budget_rejects_without_partial_effects(self):
         self.canonical_workspace()
         self.channel.name = '\u00e9' * 6000
