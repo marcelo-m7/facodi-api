@@ -31,9 +31,10 @@ class DocumentAcquisitionError(ValueError):
 def extract_document(content, extension, *, budget_seconds=30):
     try:
         result = subprocess.run(
-            [sys.executable, str(_WORKER_SCRIPT)],
+            [sys.executable, '-I', str(_WORKER_SCRIPT)],
             input=json.dumps({'content': base64.b64encode(content).decode('ascii'), 'extension': extension}),
             capture_output=True, text=True, timeout=budget_seconds, check=False,
+            env={'PATH': os.defpath, 'LANG': 'C.UTF-8'},
         )
     except subprocess.TimeoutExpired:
         raise DocumentAcquisitionError('DOCUMENT_TIMEOUT') from None
