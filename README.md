@@ -58,12 +58,22 @@ command atomically requeues one message, preserves the previous failed receipt
 and grants at most two additional claims, capped at twenty lifetime attempts.
 Pending commands cannot be replaced, and acknowledgements must advance both the
 command version and technical receipt. Retry cannot revive cancelled jobs or
-reset an exhausted lifetime budget. New transcript revisions remain unavailable.
+reset an exhausted lifetime budget.
 
-Fifty native API security tests passed locally. The deployment harness also
+Canonical input-required receipts reuse the native lifecycle error policy. An
+explicit transcript command creates a new immutable execution in the accepted
+workspace, preserving the provider/catalog even after intake routing changes.
+The previous accepted input, task, remote job and attempt history remain intact.
+One scoped cancellation intent marks that parent superseded; child creation and
+the parent transition roll back together. Replay returns the same child, never
+another Project or mandatory technical subtask. Learning may link exactly one
+new editorial request through the API extension point; it does not reroute the
+child through current provider configuration or execute it locally.
+
+Fifty-three native API security tests passed locally. The deployment harness also
 proves one unpublished native Learning result/attempt and idempotent replay.
 Do not enable this candidate in production: worker scheduling, all-source and
-large-catalog parity, versioned input, final integrated acceptance
+large-catalog parity, final integrated acceptance
 and productive target/image/canary proof remain required. Source test success is
 not runtime image identity. Owner CI retains native Project/API gates, real
 Project concurrency and repeated upgrades.

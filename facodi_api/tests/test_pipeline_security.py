@@ -179,6 +179,83 @@ class TestPipelineSecurity(TransactionCase):
         self.assertEqual(run.attempt_count, 20)
         self.assertFalse(run.canonical_command_json)
 
+    def test_canonical_receipt_cannot_regress_or_exceed_lifetime_attempts(self):
+        self.canonical_workspace()
+        run = self.Run.create(self.values('canonical-attempt-monotonicity'))
+        processing = self.canonical_receipt(run, status='processing', revision=2, attempt=2)
+        run._apply_canonical_receipt(processing)
+        saved = run.canonical_receipt_json
+        for attempt in (1, 21):
+            with self.assertRaises(ValidationError):
+                run._apply_canonical_receipt(dict(processing, status='failed', revision=3, attempt=attempt))
+            self.assertEqual(run.canonical_receipt_json, saved)
+            self.assertEqual(run.attempt_count, 2)
+        self.assertFalse(run._apply_canonical_receipt(dict(processing, revision=1, status='queued', attempt=0)))
+        self.assertEqual(run.status, 'running')
+
+    def test_canonical_transcript_revision_preserves_accepted_route_provider_catalog_and_parent(self):
+        workspace = self.canonical_workspace()
+        run = self.Run.create(dict(self.values('canonical-input'), source_type='youtube',
+                                   source_url='https://www.youtube.com/watch?v=4GVbqYFmGBw',
+                                   is_manual_transcript=True))
+        failure = self.canonical_receipt(run, status='failed', revision=2, attempt=1,
+                                         result={'error_code': 'YOUTUBE_LANGUAGE_UNAVAILABLE'})
+        run._apply_canonical_receipt(failure)
+        self.assertEqual(run.status, 'waiting_input')
+        expected = run.revision
+        original = (run.raw_content, run.canonical_payload_json, run.canonical_job_id, run.task_id)
+        params = self.env['ir.config_parameter'].sudo()
+        params.set_param('facodi_api.canonical_intake_enabled', 'false')
+        params.set_param('facodi_api.enrichment_provider', 'invalid-after-acceptance')
+        self.channel.name = 'Human rename after accepted catalog'
+        projects_before = self.env['project.project'].search_count([])
+        tasks_before = self.env['project.task'].search_count([])
+        with patch.object(type(self.Run), '_call_canonical_boundary', side_effect=AssertionError('No network before commit')):
+            child = run.action_supply_transcript('Explicit corrected transcript.', 'canonical-input-child', expected_revision=expected)
+            replay = run.action_supply_transcript('Explicit corrected transcript.', 'canonical-input-child', expected_revision=expected)
+        self.assertEqual(child, replay)
+        self.assertEqual(child.execution_plane, 'supabase')
+        self.assertEqual(child.project_id, workspace)
+        self.assertNotEqual(child.task_id, run.task_id)
+        self.assertNotEqual(child.task_id.facodi_ref, run.task_id.facodi_ref)
+        self.assertFalse(child.task_id.facodi_external_ref)
+        self.assertFalse(child.task_id.parent_id)
+        self.assertEqual(child.input_parent_id, run)
+        self.assertEqual(child.provider_config_json, run.provider_config_json)
+        self.assertEqual(child.catalog_snapshot_json, run.catalog_snapshot_json)
+        self.assertEqual(json.loads(child.canonical_payload_json)['raw_content'], 'Explicit corrected transcript.')
+        self.assertEqual((run.raw_content, run.canonical_payload_json, run.canonical_job_id, run.task_id), original)
+        self.assertEqual(run.status, 'cancelled')
+        self.assertEqual(run.error_message, 'SUPERSEDED_BY_INPUT')
+        self.assertEqual(json.loads(run.history_json)[-1]['command'], 'input')
+        self.assertEqual(self.env['project.project'].search_count([]), projects_before)
+        self.assertEqual(self.env['project.task'].search_count([]), tasks_before + 1)
+        command = json.loads(run.canonical_command_json)
+        with patch.object(type(self.Run), '_call_canonical_boundary', return_value={
+                'receipt': dict(failure, status='cancelled', revision=3, result={'error_code': 'CANCELLED_BY_OPERATOR'}),
+                'command_id': command['command_id'], 'command_revision': 1}):
+            self.assertTrue(self.Run._dispatch_canonical_receipts())
+        self.assertFalse(run.canonical_command_json)
+        self.assertEqual(run.error_message, 'SUPERSEDED_BY_INPUT')
+        self.assertFalse(child.canonical_job_id)
+
+    def test_canonical_transcript_revision_rolls_back_child_task_and_cancel_intent(self):
+        self.canonical_workspace()
+        run = self.Run.create(dict(self.values('canonical-input-rollback'), source_type='youtube',
+                                   source_url='https://www.youtube.com/watch?v=4GVbqYFmGBw',
+                                   is_manual_transcript=True))
+        run._apply_canonical_receipt(self.canonical_receipt(run, status='failed', revision=2, attempt=1,
+                                                          result={'error_code': 'YOUTUBE_TRANSCRIPTS_DISABLED'}))
+        tasks_before = self.env['project.task'].search_count([])
+        with self.assertRaises(ValidationError), self.env.cr.savepoint():
+            run.action_supply_transcript('Explicit revised input.', 'canonical-input-rollback-child', expected_revision=run.revision)
+            raise ValidationError('Disposable caller rollback')
+        run.invalidate_recordset()
+        self.assertEqual(run.status, 'waiting_input')
+        self.assertFalse(run.canonical_command_json)
+        self.assertFalse(run.input_revision_ids)
+        self.assertEqual(self.env['project.task'].search_count([]), tasks_before)
+
     def test_canonical_cancel_accepts_one_intent_without_network_and_dispatches_afterwards(self):
         self.canonical_workspace()
         run = self.Run.create(self.values('canonical-cancel'))
