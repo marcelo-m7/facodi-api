@@ -82,8 +82,10 @@ another Project or mandatory technical subtask. Learning may link exactly one
 new editorial request through the API extension point; it does not reroute the
 child through current provider configuration or execute it locally.
 
-Fifty-five native API security tests and 105 pure contracts passed locally. The deployment harness also
-proves one unpublished native Learning result/attempt and idempotent replay.
+The preceding local pure suite passed 105 contracts. The 2026-10-09 isolated
+API E2E passed all 56 native API security tests with zero failures or errors;
+the deployment harness also proves one unpublished native Learning
+result/attempt and idempotent replay.
 Do not enable this candidate in production: worker scheduling, all-source and
 large-catalog parity, final integrated acceptance
 and productive target/image/canary proof remain required. Source test success is
