@@ -1,7 +1,9 @@
 """Exercise ORM boundaries in the real Odoo registry (not source-text assertions)."""
 import importlib.util
+import base64
 import unittest
 import json
+import os
 from uuid import uuid4
 from unittest.mock import patch
 
@@ -348,6 +350,80 @@ class TestPipelineSecurity(TransactionCase):
         self.assertEqual(run.canonical_payload_json, accepted)
         self.assertFalse(run.canonical_job_id)
 
+    def test_canonical_document_and_large_catalog_upload_from_accepted_scope_before_receipt(self):
+        self.canonical_workspace()
+        self.channel.name = '"' * 31000
+        content = b'Accepted document bytes that must remain immutable.'
+        attachment = self.env['ir.attachment'].with_user(self.operator).create({
+            'name': 'accepted.txt',
+            'datas': base64.b64encode(content).decode('ascii'),
+            'mimetype': 'text/plain',
+        })
+        run = self.Run.create(dict(
+            self.values('canonical-artifact-source'), source_type='document',
+            raw_content='', attachment_id=attachment.id,
+        ))
+        request = json.loads(run.canonical_payload_json)
+        self.assertEqual(request['execution_runtime'], 'isolated')
+        self.assertEqual(request['source_filename'], 'accepted.txt')
+        self.assertEqual(request['source_artifact']['byte_length'], len(content))
+        self.assertEqual(request['source_artifact']['key'].split('/')[3], run.task_id.facodi_ref[5:])
+        self.assertIn('catalog_artifact', request)
+        self.assertNotIn('catalog_snapshot', request)
+        self.assertLessEqual(len(run.canonical_payload_json.encode('utf-8')), 60000)
+
+        events = []
+        class ArtifactResponse:
+            status_code = 201
+
+            def __init__(self, artifact):
+                self.artifact = artifact
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def iter_content(self, chunk_size):
+                self_chunk = json.dumps({'artifact': self.artifact}).encode('utf-8')
+                yield self_chunk
+
+        expected_artifacts = {
+            'source': request['source_artifact'],
+            'catalog': request['catalog_artifact'],
+        }
+        expected_contents = {
+            'source': content,
+            'catalog': json.dumps(json.loads(run.catalog_snapshot_json), sort_keys=True,
+                                  ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+        }
+
+        def boundary(record, payload):
+            events.append('submit')
+            self.assertEqual(payload['request'], request)
+            return self.canonical_receipt(record)
+
+        def upload(_session, url, **kwargs):
+            kind = url.rsplit('/', 1)[-1]
+            self.assertIn(kind, expected_artifacts)
+            events.append('upload:' + kind)
+            self.assertIn('/artifacts/%s/%s/%s' % (
+                run.company_id.id, run.task_id.facodi_ref[5:], kind), url)
+            self.assertEqual(kwargs['data'], expected_contents[kind])
+            self.assertFalse(kwargs['allow_redirects'])
+            return ArtifactResponse(expected_artifacts[kind])
+
+        with patch.dict(os.environ, {
+            'SUPABASE_URL': 'https://bhfywztfyidvrlarebmg.supabase.co',
+            'SUPABASE_SECRET_KEY': 'sb_secret_disposable',
+        }), patch.object(type(self.Run), '_call_canonical_boundary', boundary), \
+                patch('requests.Session.post', autospec=True, side_effect=upload):
+            self.env['facodi.pipeline.run']._dispatch_canonical_receipts()
+        self.assertEqual(events, ['submit', 'upload:source', 'upload:catalog'])
+        self.assertTrue(run.canonical_job_id)
+        self.assertEqual(run.status, 'received')
+
     def test_canonical_unsupported_or_oversized_source_fails_before_acceptance(self):
         self.canonical_workspace()
         before = self.env['facodi.pipeline.run'].search_count([])
@@ -398,15 +474,16 @@ class TestPipelineSecurity(TransactionCase):
         self.assertFalse(run.published_slide_id)
         self.assertFalse(run._apply_canonical_receipt(receipt))
 
-    def test_canonical_ascii_transport_budget_rejects_without_partial_effects(self):
+    def test_canonical_large_catalog_moves_to_private_artifact_with_bounded_request(self):
         self.canonical_workspace()
         self.channel.name = '\u00e9' * 6000
-        before = self.env['facodi.pipeline.run'].search_count([])
-        tasks_before = self.env['project.task'].search_count([])
-        with self.assertRaises(UserError), self.env.cr.savepoint():
-            self.Run.create(dict(self.values('canonical-escaped-budget'), raw_content='\U0001f600' * 3000))
-        self.assertEqual(self.env['facodi.pipeline.run'].search_count([]), before)
-        self.assertEqual(self.env['project.task'].search_count([]), tasks_before)
+        run = self.Run.create(dict(
+            self.values('canonical-escaped-budget'), raw_content='\U0001f600' * 3000,
+        ))
+        request = json.loads(run.canonical_payload_json)
+        self.assertIn('catalog_artifact', request)
+        self.assertNotIn('catalog_snapshot', request)
+        self.assertLessEqual(len(run.canonical_payload_json.encode('utf-8')), 60000)
 
     def test_canonical_legacy_payload_and_ascii_receipt_replay_remain_compatible(self):
         self.canonical_workspace()
