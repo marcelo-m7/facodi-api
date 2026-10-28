@@ -1,0 +1,16 @@
+{
+  "name": "facodi-mcp-oauth-consent",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "node ../tests/test_mcp_consent_flow.mjs",
+    "build": "esbuild static/src/consent_app.mjs --bundle --platform=browser --format=iife --target=es2020 --minify --outfile=static/dist/consent.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.118.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}

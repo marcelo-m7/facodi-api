@@ -1,0 +1,29 @@
+.monynha-oauth-wrap { background: #f6f8fa; }
+.monynha-consent { min-height: 74vh; display: grid; place-items: center; padding: 64px 20px; color: #192433; }
+.monynha-consent__shell { width: min(100%, 620px); background: white; border: 1px solid #dde3eb; border-radius: 22px; padding: clamp(26px, 5vw, 48px); box-shadow: 0 24px 90px rgb(20 33 50 / 8%); }
+.monynha-consent__header { margin-bottom: 32px; }
+.monynha-consent__brand { font-size: 13px; font-weight: 800; letter-spacing: .15em; margin-bottom: 32px; }
+.monynha-consent__brand span { color: #84909d; font-weight: 500; }
+.monynha-consent__eyebrow { color: #5e6e83; font-size: 11px; font-weight: 800; letter-spacing: .14em; }
+.monynha-consent h1 { font-size: clamp(28px, 5vw, 39px); letter-spacing: -.045em; font-weight: 700; margin: 10px 0; }
+.monynha-consent h2 { font-size: 20px; font-weight: 700; margin-bottom: 12px; }
+.monynha-consent p { line-height: 1.6; }
+.monynha-consent__header p, .monynha-consent__hint { color: #647185; font-size: 14px; }
+.monynha-consent__status { color: #647185; }
+.monynha-consent label { display: block; font-size: 13px; font-weight: 650; margin: 18px 0 8px; }
+.monynha-consent input { width: 100%; padding: 13px 15px; border: 1px solid #ccd5df; border-radius: 9px; background: #fbfcfe; }
+.monynha-consent input:focus-visible, .monynha-consent button:focus-visible { outline: 3px solid #729fdf; outline-offset: 3px; }
+.monynha-consent__button { border: 1px solid #c9d3df; border-radius: 10px; padding: 13px 21px; font-weight: 650; cursor: pointer; transition: background .15s ease; }
+.monynha-consent__button--primary { background: #1b3b65; color: white; border-color: #1b3b65; }
+.monynha-consent__button--primary:hover { background: #102b4d; color: white; }
+.monynha-consent__button--neutral { background: #fff; color: #253650; }
+.monynha-consent__button--neutral:hover { background: #f1f4f8; }
+#monynha-oauth-login-form button { width: 100%; margin-top: 24px; }
+.monynha-consent__details { display: grid; grid-template-columns: 155px minmax(0, 1fr); gap: 12px; border-top: 1px solid #e7ebf0; border-bottom: 1px solid #e7ebf0; padding: 22px 0; margin: 20px 0; font-size: 13px; }
+.monynha-consent dt { color: #687789; font-weight: 500; }
+.monynha-consent dd { margin: 0; overflow-wrap: anywhere; font-weight: 600; }
+.monynha-consent__actions { display: flex; gap: 12px; justify-content: flex-end; margin-top: 24px; }
+.monynha-consent__signout { display: block; background: none; padding: 0; margin-top: 24px; border: 0; color: #405e81; text-decoration: underline; }
+.monynha-consent__footer { border-top: 1px solid #e9edf2; padding-top: 18px; margin-top: 32px; color: #7b8797; font-size: 11px; }
+#monynha-oauth-message { color: #983c3c; margin-top: 15px; font-size: 13px; }
+@media (max-width: 520px) { .monynha-consent { padding: 32px 12px; } .monynha-consent__details { grid-template-columns: 1fr; gap: 4px; } .monynha-consent dt { margin-top: 12px; } .monynha-consent__actions { flex-direction: column-reverse; } .monynha-consent__actions button { width: 100%; } }
