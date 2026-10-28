@@ -1,0 +1,2 @@
+# Vendored esbuild output includes source strings whose whitespace is semantic.
+facodi_mcp_oauth/static/dist/consent.js -whitespace

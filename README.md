@@ -1,5 +1,37 @@
 # FACODI API
 
+## Monynha MCP Open2 OAuth consent
+
+`facodi_mcp_oauth` is a separate, Website-only addon providing
+`GET /oauth/consent` for the existing Open2 OAuth Server (Supabase project
+`wvkjainfwsyiyfcmbtid`). It is intentionally **not** tied to Odoo sessions,
+the FACODI processing-plane Supabase client, or any ERP account. The page
+uses only `MONYNHA_OAUTH_SUPABASE_PUBLISHABLE_KEY` (browser-safe Open2 public
+key) and an explicit JSON `MONYNHA_OAUTH_ALLOWED_CLIENT_IDS` allowlist. If
+either is absent the route returns HTTP 503, with no credential prompt. No
+`service_role` or Odoo API key is used or transmitted.
+
+The bundled, pinned Supabase JS SDK loads authorization details, performs
+Open2 password sign-in when necessary, and presents the exact registered
+client, redirect URI and identity scopes. The user must click Authorize or
+Deny; all authorization codes and OAuth redirects come from Supabase Auth.
+Independent Monynha membership/client/connection policies still decide Odoo
+capabilities, and write tools remain disabled separately.
+
+To rebuild the committed browser bundle after changing the source:
+
+```bash
+cd facodi_mcp_oauth
+npm ci
+npm run build
+npm test
+```
+
+**Production gate:** the new module and its Compose configuration must be
+reviewed, built, installed and browser-tested on the real FACODI Website.
+Do not change the Open2 global Site URL, do not enable broad token hooks and
+do not treat a successful consent redirect as authorization to use Odoo.
+
 This repository owns FACODI technical processing: ingestion, normalization, enrichment, jobs, checkpoints and proposed matching. Its Python core is independent of Odoo and Learning. The Odoo facade and HTTP transport share authorized commands; Learning owns editorial results, courses, content, review and publication. Supabase and Stripe bridges remain separate integrations.
 
 ## INC-P2 Bounded Text Candidate

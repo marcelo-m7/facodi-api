@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <template id="consent_page" name="Monynha Open2 OAuth consent">
+        <t t-call="website.layout">
+            <t t-set="pageName" t-value="'monynha-oauth-consent'"/>
+            <div id="wrap" class="oe_structure monynha-oauth-wrap">
+                <main class="monynha-consent" id="monynha-oauth-root"
+                      t-att-data-supabase-url="supabase_url"
+                      t-att-data-publishable-key="publishable_key"
+                      t-att-data-allowed-clients="allowed_clients"
+                      t-att-data-authorization-id="authorization_id">
+                    <div class="monynha-consent__shell">
+                        <header class="monynha-consent__header">
+                            <div class="monynha-consent__brand">MONYNHA <span>× FACODI</span></div>
+                            <span class="monynha-consent__eyebrow">SECURE CONNECTION</span>
+                            <h1>Connect an application</h1>
+                            <p>Sign in with your Open2 account and choose whether this application can connect through Monynha Odoo MCP.</p>
+                        </header>
+
+                        <section id="monynha-oauth-loading" aria-live="polite">
+                            <p class="monynha-consent__status">Checking authorization request…</p>
+                        </section>
+
+                        <section id="monynha-oauth-login" hidden="hidden" aria-labelledby="monynha-oauth-login-title">
+                            <h2 id="monynha-oauth-login-title">Sign in to Open2</h2>
+                            <p class="monynha-consent__hint">Your FACODI Website login is separate from your Open2 identity.</p>
+                            <form id="monynha-oauth-login-form" autocomplete="on">
+                                <label for="monynha-oauth-email">Email address</label>
+                                <input id="monynha-oauth-email" name="email" type="email" required="required" autocomplete="username"/>
+                                <label for="monynha-oauth-password">Password</label>
+                                <input id="monynha-oauth-password" name="password" type="password" required="required" autocomplete="current-password"/>
+                                <button type="submit" class="monynha-consent__button monynha-consent__button--primary">Continue</button>
+                            </form>
+                        </section>
+
+                        <section id="monynha-oauth-consent" hidden="hidden" aria-labelledby="monynha-oauth-consent-title">
+                            <h2 id="monynha-oauth-consent-title">Authorization request</h2>
+                            <p class="monynha-consent__hint">Only approve applications you trust. This approval does not grant Odoo access by itself.</p>
+                            <dl class="monynha-consent__details">
+                                <dt>Application</dt><dd id="monynha-oauth-client-name"></dd>
+                                <dt>Client ID</dt><dd id="monynha-oauth-client-id"></dd>
+                                <dt>Callback URL</dt><dd id="monynha-oauth-redirect-uri"></dd>
+                                <dt>Requested identity scopes</dt><dd id="monynha-oauth-scopes"></dd>
+                                <dt>Open2 account</dt><dd id="monynha-oauth-user-email"></dd>
+                            </dl>
+                            <p class="monynha-consent__hint">Odoo permissions are granted separately by a Monynha administrator and remain read-only by default.</p>
+                            <div class="monynha-consent__actions">
+                                <button id="monynha-oauth-deny" type="button" class="monynha-consent__button monynha-consent__button--neutral">Deny</button>
+                                <button id="monynha-oauth-approve" type="button" class="monynha-consent__button monynha-consent__button--primary">Authorize</button>
+                            </div>
+                            <button id="monynha-oauth-signout" type="button" class="monynha-consent__signout">Use a different Open2 account</button>
+                        </section>
+
+                        <section id="monynha-oauth-error" hidden="hidden" aria-live="assertive">
+                            <h2>Connection unavailable</h2>
+                            <p>The authorization request could not be completed. Return to the application and try again.</p>
+                        </section>
+
+                        <p id="monynha-oauth-message" role="alert" hidden="hidden"></p>
+                        <footer class="monynha-consent__footer">Authorization powered by Open2 Supabase Auth. No Odoo credentials are shared with the application.</footer>
+                    </div>
+                </main>
+            </div>
+            <link rel="stylesheet" href="/facodi_mcp_oauth/static/src/consent.css"/>
+            <script defer="defer" src="/facodi_mcp_oauth/static/dist/consent.js"></script>
+        </t>
+    </template>
+
+    <template id="consent_unavailable" name="Monynha OAuth not configured">
+        <t t-call="website.layout">
+            <div id="wrap" class="container py-5"><h1>Connection unavailable</h1>
+                <p>OAuth consent is not configured for this Website.</p></div>
+        </t>
+    </template>
+
+    <template id="consent_invalid" name="Monynha invalid OAuth request">
+        <t t-call="website.layout">
+            <div id="wrap" class="container py-5"><h1>Invalid authorization request</h1>
+                <p>Return to your application and start the connection again.</p></div>
+        </t>
+    </template>
+</odoo>
